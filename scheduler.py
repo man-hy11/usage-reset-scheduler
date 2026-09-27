@@ -57,12 +57,22 @@ def _format_when(epoch: int) -> str:
     return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _queue_order_key(item: tuple[int, AccountState]) -> tuple[int, int, int]:
+    """다음 실행 예정 순서로 정렬하는 키. free_skip(next_run_at=None)은 맨 뒤로,
+    같은 next_run_at끼리는 account_id 오름차순으로 묶는다."""
+    account_id, state = item
+    if state.next_run_at is None:
+        return (1, 0, account_id)
+    return (0, state.next_run_at, account_id)
+
+
 def format_queue_summary(states: dict[int, AccountState]) -> str:
     header = "==========큐상태============"
     footer = "=" * len(header)
     lines = [header]
 
-    for index, account_id in enumerate(sorted(states), start=1):
+    ordered_ids = [account_id for account_id, _ in sorted(states.items(), key=_queue_order_key)]
+    for index, account_id in enumerate(ordered_ids, start=1):
         state = states[account_id]
         lines.append(f"{index}. user{account_id} [{state.tool}]")
 

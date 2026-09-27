@@ -1082,11 +1082,11 @@ def test_format_queue_summary_shows_each_account_status():
 
     summary = scheduler.format_queue_summary(states)
 
-    assert "1. user1" in summary
+    assert "user1" in summary
     assert "상태: scheduled" in summary
-    assert "2. user2" in summary
+    assert "user2" in summary
     assert "상태: free_skip" in summary
-    assert "3. user3" in summary
+    assert "user3" in summary
     assert "상태: retry_pending" in summary
     assert "실패 3회" in summary
 
@@ -1132,7 +1132,7 @@ def test_format_queue_summary_includes_date_not_just_time_of_day():
     assert expected_date in summary
 
 
-def test_format_queue_summary_orders_by_account_id():
+def test_format_queue_summary_orders_by_account_id_when_next_run_at_ties():
     states = {
         3: scheduler.AccountState(next_run_at=100, status="scheduled"),
         1: scheduler.AccountState(next_run_at=100, status="scheduled"),
@@ -1142,6 +1142,31 @@ def test_format_queue_summary_orders_by_account_id():
     summary = scheduler.format_queue_summary(states)
 
     assert summary.index("user1") < summary.index("user2") < summary.index("user3")
+
+
+def test_format_queue_summary_orders_by_next_run_at_not_account_id():
+    # 실사례 버그 리포트: account_id 순서로 나오면 "다음 실행 순서"처럼 보여서
+    # 헷갈린다는 지적 — 실제 다음 실행 시각 순서로 나와야 한다.
+    states = {
+        1: scheduler.AccountState(next_run_at=300, status="scheduled"),  # 가장 나중
+        2: scheduler.AccountState(next_run_at=100, status="scheduled"),  # 가장 이름
+        3: scheduler.AccountState(next_run_at=200, status="scheduled"),  # 중간
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert summary.index("user2") < summary.index("user3") < summary.index("user1")
+
+
+def test_format_queue_summary_places_free_skip_accounts_last():
+    states = {
+        1: scheduler.AccountState(next_run_at=None, status="free_skip"),
+        2: scheduler.AccountState(next_run_at=500, status="scheduled"),
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert summary.index("user2") < summary.index("user1")
 
 
 def test_format_queue_summary_includes_usage_limits_when_known():

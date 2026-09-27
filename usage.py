@@ -102,11 +102,21 @@ def compute_next_run(
     week_pct = status.get("weekly_used_percent")
     week_reset = status.get("weekly_reset_at")
 
-    if None in (five_pct, five_reset, week_pct, week_reset):
+    # 주간 소진 여부를 판단하려면 week_pct가 반드시 있어야 한다. 그 다음
+    # 실제로 목표로 삼을 reset 시각(week_reset 또는 five_reset)만 있으면
+    # 계산할 수 있다 — 반대쪽 창의 필드는 없어도 상관없다. 예: 주간이
+    # threshold 이상 소진된 계정은 5시간 윈도우가 아직 한 번도 열리지 않아
+    # five_hour_reset_at이 None으로 오는 경우가 실제로 있다.
+    if week_pct is None:
         return fallback
 
-    target = week_reset if week_pct >= threshold else five_reset
+    if week_pct >= threshold:
+        target = week_reset
+    else:
+        target = five_reset
 
+    if target is None:
+        return fallback
     if target <= now:
         return fallback
     if target - now + 60 >= MAX_SLEEP_SECONDS:

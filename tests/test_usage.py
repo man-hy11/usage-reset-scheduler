@@ -32,6 +32,34 @@ def test_compute_next_run_returns_fallback_when_reset_field_partially_missing():
     assert seconds == 7 * 60
 
 
+def test_compute_next_run_uses_weekly_reset_even_when_five_hour_reset_is_none():
+    # 실사례(user3): 주간 한도가 100% 소진돼 5시간 윈도우가 아직 한 번도 열리지
+    # 않은 계정은 five_hour_reset_at을 None으로 반환한다. week_pct가 threshold
+    # 이상이면 애초에 five_hour 값과 무관하게 주간 리셋만 보면 되므로, 이 경우
+    # fallback으로 떨어지면 안 되고 정상적으로 주간 리셋 + 60초를 반환해야 한다.
+    status = {
+        "five_hour_used_percent": 0.0,
+        "five_hour_reset_at": None,
+        "weekly_used_percent": 100,
+        "weekly_reset_at": 1_790_470_200,
+    }
+    seconds = usage.compute_next_run(status, threshold=100, fallback_min=5, now=1_790_469_000)
+    assert seconds == 1260  # weekly_reset_at - now + 60
+
+
+def test_compute_next_run_uses_five_hour_reset_even_when_weekly_reset_is_none():
+    # 대칭 사례: 주간이 threshold 미만이면 five_hour 값만 있으면 계산 가능해야
+    # 하고, weekly_reset_at이 None이어도 fallback으로 떨어지면 안 된다.
+    status = {
+        "five_hour_used_percent": 100,
+        "five_hour_reset_at": 1_790_469_600,
+        "weekly_used_percent": 42,
+        "weekly_reset_at": None,
+    }
+    seconds = usage.compute_next_run(status, threshold=100, fallback_min=5, now=1_790_469_000)
+    assert seconds == 660  # five_hour_reset_at - now + 60
+
+
 def test_compute_next_run_uses_five_hour_reset_when_weekly_under_threshold():
     status = {
         "five_hour_used_percent": 100,
@@ -52,6 +80,19 @@ def test_compute_next_run_uses_weekly_reset_when_weekly_at_or_over_threshold():
     }
     seconds = usage.compute_next_run(status, threshold=100, fallback_min=305, now=1_790_469_000)
     assert seconds == 1260  # weekly_reset_at - now + 60
+
+
+def test_compute_next_run_falls_back_when_weekly_used_percent_missing():
+    # week_pct 자체가 없으면 threshold와 비교할 수 없으니 fallback으로 떨어져야
+    # 한다 (TypeError로 죽으면 안 됨).
+    status = {
+        "five_hour_used_percent": 10,
+        "five_hour_reset_at": 1_790_469_600,
+        "weekly_used_percent": None,
+        "weekly_reset_at": 1_791_073_800,
+    }
+    seconds = usage.compute_next_run(status, threshold=100, fallback_min=5, now=1_790_469_000)
+    assert seconds == 5 * 60
 
 
 def test_compute_next_run_falls_back_when_target_reset_in_past():
