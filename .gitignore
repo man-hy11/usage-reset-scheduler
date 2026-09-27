@@ -1,1 +1,4 @@
 .worktrees/
+.schedule/
+__pycache__/
+*.pyc

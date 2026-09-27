@@ -112,3 +112,31 @@
 - 테스트: 두 테스트 스크립트 통과, 전체 Bash 구문 검사 통과, Codex 및 Claude 실제 사용량 API 조회와 다음 시각 계산 통과.
 - 남은 이슈: 실제 무한 loop는 모델 호출 및 장시간 대기를 발생시키므로 실행하지 않았다.
 - 롤백: 실행 스크립트를 이전 `prompt.md` 기반 버전으로 복원하고 `collect-usage.sh`의 대상 선택 조건을 임계치 기반으로 되돌린다.
+
+## 2026-09-27 우선순위 큐 스케줄러로 전환 (Python)
+
+- 상태: 완료
+- 배경: 계정을 여러 개 지정하면 `run-step-loop-claude.sh`가 계정별로 완전히 독립된
+  백그라운드 프로세스를 띄우는 구조였다. 이를 단일 컨트롤러가 각 계정의 다음 실행
+  시각을 `heapq` 기반 우선순위 큐로 관리하고, `claude` 호출을 완전 순차로 실행하는
+  구조로 바꿨다.
+- 설계 문서: `docs/superpowers/specs/2026-09-27-priority-queue-scheduler-design.md`
+- 구현: `usage.py`(사용량 조회 및 다음 실행 시각 계산), `accounts.py`(계정 디렉터리
+  규칙, 유료 구독 게이트, 계정 관리), `scheduler.py`(우선순위 큐 메인 루프 및 CLI
+  진입점)를 Python으로 신규 작성했다.
+- 무료 플랜 계정은 최초 1회 확인 후 큐에서 영구 제외하며 재확인하지 않는다.
+- 사용량 조회 실패 계정은 `retry_pending` 상태로 유지되며, 큐에서 어떤 계정이든
+  pop될 때마다 실패 이력 있는 계정들을 먼저 재조회한다. 5회 이상 연속 실패해도
+  포기하지 않고 계속 재시도하되 로그 심각도만 올린다.
+- 계정 자격증명 위치(`~/.claude`, `~/.claude-account-N`)는 변경하지 않았다.
+- 삭제: `run-step-loop-claude.sh`와 관련 bash 테스트·모의 CLI 일체.
+- 유지: `run-step-loop.sh`(Codex)는 이번 전환 범위 밖이다. `collect-usage.sh`도
+  `run-step-loop.sh:112`에서 여전히 참조하므로 삭제하지 않았다.
+- Windows 네이티브 지원은 표준 라이브러리(`pathlib`, `subprocess`, `time`,
+  `heapq`) 위주로 작성해 이식 가능성을 열어뒀으나, 실제 Windows 환경 검증은
+  하지 않았다. `claude`/`codex` CLI 자체의 Windows `CLAUDE_CONFIG_DIR` 지원 여부는
+  이 전환의 통제 범위 밖이다.
+- 테스트: `tests/test_usage.py`, `tests/test_accounts.py`, `tests/test_scheduler.py`
+  (pytest)로 전체 재작성. 전체 스위트 통과 (62/62).
+- 롤백: git 이력에서 `run-step-loop-claude.sh`와 관련 bash 테스트를 복원하고
+  `scheduler.py`/`accounts.py`/`usage.py`, `.schedule/`를 제거한다.
