@@ -5,7 +5,7 @@ Claude Code(`claude` CLI)와 Codex CLI(`codex`)를 여러 계정에 걸쳐 최�
 ## 요구 사항
 
 - Python 3.10+
-- `requests` (`pip install requests`)
+- `pip install -r requirements.txt` (테스트도 실행하려면 `pip install -r requirements-dev.txt`)
 - 사용할 도구의 CLI가 PATH에 있고, 최소 한 번은 로그인되어 있을 것
   - Claude: `claude auth login`
   - Codex: `codex login`
