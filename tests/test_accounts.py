@@ -14,7 +14,7 @@ def test_account_dir_for_account_1_is_dot_claude(monkeypatch, tmp_path):
 
 def test_account_dir_for_account_n_uses_suffix(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    assert accounts.account_dir(3) == tmp_path / ".claude-account-3"
+    assert accounts.account_dir(3) == tmp_path / ".usage-reset-scheduler" / "accounts" / "claude-3"
 
 
 def test_account_dir_for_codex_account_1_is_dot_codex(monkeypatch, tmp_path):
@@ -24,7 +24,7 @@ def test_account_dir_for_codex_account_1_is_dot_codex(monkeypatch, tmp_path):
 
 def test_account_dir_for_codex_account_n_uses_suffix(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    assert accounts.account_dir(4, tool="codex") == tmp_path / ".codex-account-4"
+    assert accounts.account_dir(4, tool="codex") == tmp_path / ".usage-reset-scheduler" / "accounts" / "codex-4"
 
 
 @pytest.mark.parametrize("plan", ["pro", "max", "team", "enterprise"])
@@ -101,7 +101,9 @@ def test_run_claude_auth_status_sets_config_dir_for_account_n(monkeypatch, tmp_p
 
     accounts.run_claude_auth_status(2)
 
-    assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".claude-account-2")
+    assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(
+        tmp_path / ".usage-reset-scheduler" / "accounts" / "claude-2"
+    )
 
 
 def test_run_claude_auth_status_raises_on_bad_json(monkeypatch, tmp_path):
@@ -151,7 +153,7 @@ def _write_codex_auth(config_dir: Path, claims: dict) -> None:
 def test_run_claude_auth_status_codex_decodes_id_token(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     _write_codex_auth(
-        tmp_path / ".codex-account-4",
+        tmp_path / ".usage-reset-scheduler" / "accounts" / "codex-4",
         {
             "email": "a@example.com",
             "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
@@ -281,9 +283,10 @@ def test_add_account_creates_dir_and_runs_login(monkeypatch, tmp_path):
 
     accounts.add_account(2)
 
-    assert (tmp_path / ".claude-account-2").is_dir()
+    expected_dir = tmp_path / ".usage-reset-scheduler" / "accounts" / "claude-2"
+    assert expected_dir.is_dir()
     assert captured["cmd"] == ["claude", "auth", "login"]
-    assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".claude-account-2")
+    assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(expected_dir)
 
 
 def test_add_account_codex_creates_dir_and_runs_codex_login(monkeypatch, tmp_path):
@@ -300,21 +303,22 @@ def test_add_account_codex_creates_dir_and_runs_codex_login(monkeypatch, tmp_pat
 
     accounts.add_account(4, tool="codex")
 
-    assert (tmp_path / ".codex-account-4").is_dir()
+    expected_dir = tmp_path / ".usage-reset-scheduler" / "accounts" / "codex-4"
+    assert expected_dir.is_dir()
     assert captured["cmd"] == ["codex", "login"]
-    assert captured["env"]["CODEX_HOME"] == str(tmp_path / ".codex-account-4")
+    assert captured["env"]["CODEX_HOME"] == str(expected_dir)
 
 
 def test_remove_account_moves_to_backup_path(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    target = tmp_path / ".claude-account-2"
-    target.mkdir()
+    target = tmp_path / ".usage-reset-scheduler" / "accounts" / "claude-2"
+    target.mkdir(parents=True)
 
     backup = accounts.remove_account(2)
 
     assert not target.exists()
     assert backup.exists()
-    assert str(backup).startswith(str(tmp_path / ".claude-account-2.removed-"))
+    assert str(backup).startswith(str(target) + ".removed-")
 
 
 def test_remove_account_1_raises_value_error(monkeypatch, tmp_path):
@@ -334,12 +338,13 @@ def test_remove_account_missing_raises_file_not_found(monkeypatch, tmp_path):
 
 def test_list_accounts_reports_status_for_each(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    account2_dir = tmp_path / ".usage-reset-scheduler" / "accounts" / "claude-2"
     (tmp_path / ".claude").mkdir()
-    (tmp_path / ".claude-account-2").mkdir()
+    account2_dir.mkdir(parents=True)
 
     responses = {
         str(tmp_path / ".claude"): '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "pro", "email": "a@example.com"}',
-        str(tmp_path / ".claude-account-2"): '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "free"}',
+        str(account2_dir): '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "free"}',
     }
 
     def fake_run(cmd, capture_output, text, env, check):
@@ -361,9 +366,10 @@ def test_list_accounts_reports_status_for_each(monkeypatch, tmp_path):
 
 def test_list_accounts_discovers_codex_dirs_and_uses_get_tool(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    account4_dir = tmp_path / ".usage-reset-scheduler" / "accounts" / "codex-4"
     (tmp_path / ".claude").mkdir()
     _write_codex_auth(
-        tmp_path / ".codex-account-4",
+        account4_dir,
         {"email": "b@example.com", "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"}},
     )
 
@@ -385,4 +391,4 @@ def test_list_accounts_discovers_codex_dirs_and_uses_get_tool(monkeypatch, tmp_p
     assert result_by_id[4][4] == "codex"
     assert result_by_id[4][1] == "plus"
     assert result_by_id[4][3] == "b@example.com"
-    assert result_by_id[4][2] == tmp_path / ".codex-account-4"
+    assert result_by_id[4][2] == account4_dir

@@ -658,7 +658,9 @@ def test_main_list_accounts_shows_dash_when_email_unknown(monkeypatch, capsys, t
     monkeypatch.setattr(
         accounts,
         "list_accounts",
-        lambda get_tool=None: [(2, "SKIP: free", tmp_path / ".claude-account-2", None, "claude")],
+        lambda get_tool=None: [
+            (2, "SKIP: free", tmp_path / ".usage-reset-scheduler" / "accounts" / "claude-2", None, "claude")
+        ],
     )
 
     rc = scheduler.main(["--list-accounts"])

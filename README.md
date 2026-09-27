@@ -60,8 +60,10 @@ python3 scheduler.py 1 -w "2026-10-01 09:00"
 
 | 계정 번호 | claude 설정 디렉터리 | codex 설정 디렉터리 |
 |---|---|---|
-| `1` | `~/.claude` | `~/.codex` |
-| `N` (2 이상) | `~/.claude-account-N` | `~/.codex-account-N` |
+| `1` | `~/.claude` (CLI 기본값) | `~/.codex` (CLI 기본값) |
+| `N` (2 이상) | `~/.usage-reset-scheduler/accounts/claude-N` | `~/.usage-reset-scheduler/accounts/codex-N` |
+
+`user1`은 각 CLI의 기본 설정 위치를 그대로 쓰고, 추가 계정(`N≥2`)은 홈 디렉터리를 어지럽히지 않도록 `~/.usage-reset-scheduler/accounts/` 아래에 모아둡니다.
 
 같은 계정 번호를 claude와 codex 양쪽에 동시에 등록할 수는 없습니다 — 번호 하나는 등록 시점에 결정된 도구 하나에만 대응합니다.
 
@@ -88,9 +90,9 @@ python3 scheduler.py --remove-account 2   # 또는: python3 scheduler.py -r 2
 `--list-accounts` 출력 예:
 ```
 user1    [claude] pro          user1@example.com         ~/.claude
-user2    [claude] pro          user2@example.com      ~/.claude-account-2
-user4    [codex ] plus         user4@example.com            ~/.codex-account-4
-user5    [claude] SKIP: 인증 상태 확인 실패 -                            ~/.claude-account-5
+user2    [claude] pro          user2@example.com      ~/.usage-reset-scheduler/accounts/claude-2
+user4    [codex ] plus         user4@example.com            ~/.usage-reset-scheduler/accounts/codex-4
+user5    [claude] SKIP: 인증 상태 확인 실패 -                            ~/.usage-reset-scheduler/accounts/claude-5
 ```
 이메일을 확인할 수 없는 경우(미로그인, 조회 실패 등)에는 `-`로 표시됩니다.
 

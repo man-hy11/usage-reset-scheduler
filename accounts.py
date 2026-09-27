@@ -26,14 +26,9 @@ class AccountStatusError(Exception):
 
 
 def account_dir(account_id: int, tool: str = "claude") -> Path:
-    if tool == "codex":
-        if account_id == 1:
-            return Path.home() / ".codex"
-        return Path.home() / f".codex-account-{account_id}"
-
     if account_id == 1:
-        return Path.home() / ".claude"
-    return Path.home() / f".claude-account-{account_id}"
+        return Path.home() / (".codex" if tool == "codex" else ".claude")
+    return Path.home() / ".usage-reset-scheduler" / "accounts" / f"{tool}-{account_id}"
 
 
 def classify_subscription(status: dict) -> str:
@@ -175,15 +170,14 @@ def list_accounts(get_tool=None) -> list[tuple[int, str, Path, str | None, str]]
     if get_tool is None:
         get_tool = lambda _account_id: "claude"
 
-    home = Path.home()
+    accounts_root = Path.home() / ".usage-reset-scheduler" / "accounts"
     account_ids = {1}
-    for pattern in (".claude-account-*", ".codex-account-*"):
-        for candidate in home.glob(pattern):
-            if not candidate.is_dir():
-                continue
-            suffix = candidate.name.rsplit("-", 1)[-1]
-            if suffix.isdigit() and int(suffix) >= 2:
-                account_ids.add(int(suffix))
+    for candidate in accounts_root.glob("*-*"):
+        if not candidate.is_dir():
+            continue
+        suffix = candidate.name.rsplit("-", 1)[-1]
+        if suffix.isdigit() and int(suffix) >= 2:
+            account_ids.add(int(suffix))
 
     results = []
     for account_id in sorted(account_ids):
