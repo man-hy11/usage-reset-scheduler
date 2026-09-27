@@ -256,7 +256,7 @@ def test_build_claude_command_shape():
     ]
 
 
-def test_run_claude_extracts_text_deltas_and_returns_true_on_success(monkeypatch, tmp_path, capsys):
+def test_run_claude_extracts_text_deltas_and_returns_true_on_success(monkeypatch, tmp_path):
     monkeypatch.setattr(accounts, "account_dir", lambda account_id: tmp_path / f"acct{account_id}")
 
     stream_lines = [
@@ -305,6 +305,62 @@ def test_run_claude_returns_false_on_nonzero_exit(monkeypatch, tmp_path):
     result = scheduler.run_claude(1, "claude-haiku-4-5", "low")
 
     assert result is False
+
+
+def test_run_claude_skips_non_dict_json_line_and_still_extracts_valid_text_deltas(monkeypatch, tmp_path):
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: tmp_path / f"acct{account_id}")
+
+    stream_lines = [
+        _json.dumps({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "OK"}}}),
+        _json.dumps([1, 2, 3]),
+    ]
+
+    class _FakeCompletedProcess:
+        def __init__(self):
+            self.stdout = "\n".join(stream_lines) + "\n"
+            self.returncode = 0
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, env, capture_output, text: _FakeCompletedProcess())
+    monkeypatch.setattr(scheduler, "subprocess", subprocess)
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id: log_dir)
+
+    result = scheduler.run_claude(1, "claude-haiku-4-5", "low")
+
+    assert result is True
+    logged_files = list(log_dir.glob("loop-*.log"))
+    assert len(logged_files) == 1
+    assert logged_files[0].read_text() == "OK"
+
+
+def test_run_claude_skips_non_dict_event_field_and_still_extracts_valid_text_deltas(monkeypatch, tmp_path):
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: tmp_path / f"acct{account_id}")
+
+    stream_lines = [
+        _json.dumps({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "OK"}}}),
+        _json.dumps({"type": "stream_event", "event": "oops"}),
+    ]
+
+    class _FakeCompletedProcess:
+        def __init__(self):
+            self.stdout = "\n".join(stream_lines) + "\n"
+            self.returncode = 0
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, env, capture_output, text: _FakeCompletedProcess())
+    monkeypatch.setattr(scheduler, "subprocess", subprocess)
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id: log_dir)
+
+    result = scheduler.run_claude(1, "claude-haiku-4-5", "low")
+
+    assert result is True
+    logged_files = list(log_dir.glob("loop-*.log"))
+    assert len(logged_files) == 1
+    assert logged_files[0].read_text() == "OK"
 
 
 def test_main_check_subscription_prints_plan_and_returns_zero(monkeypatch, capsys):

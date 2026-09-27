@@ -235,9 +235,14 @@ def run_claude(account_id: int, model: str, effort: str) -> bool:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") != "stream_event":
+        if not isinstance(event, dict) or event.get("type") != "stream_event":
             continue
-        delta = (event.get("event") or {}).get("delta") or {}
+        inner_event = event.get("event")
+        if not isinstance(inner_event, dict):
+            continue
+        delta = inner_event.get("delta")
+        if not isinstance(delta, dict):
+            continue
         if delta.get("type") == "text_delta":
             text_parts.append(delta.get("text", ""))
 
