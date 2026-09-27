@@ -176,24 +176,34 @@ def initialize_states(
     wait_until: int | None,
     delay_seconds: int,
     now: int,
-    existing_states: dict[int, AccountState] | None = None,
+    threshold: float,
+    fallback_min: int,
     get_tool=None,
     plan_recheck_seconds: int = PLAN_RECHECK_MIN * 60,
 ) -> dict[int, AccountState]:
-    """Build the starting state map for `account_ids`.
+    """Build the starting state map for `account_ids` from scratch.
 
-    Every account goes through the paid-plan gate on each startup, because
-    the plan can change between runs (paid -> free or free -> paid). An
-    account that fails it becomes "free_skip" with next_run_at set to the
-    next plan re-check (now + plan_recheck_seconds). For a paid account
-    already present in `existing_states` with status "scheduled" or
-    "retry_pending", its saved next_run_at/status/fail_count are kept as-is
-    so a scheduler restart doesn't lose mid-flight progress.
+    Every script invocation (as opposed to a loop iteration within one
+    already-running process) re-derives everything live: paid-plan gate,
+    email, plan, usage-limit fields, and next_run_at. A previously saved
+    queue.json is never consulted here — it exists only so the *running*
+    loop can recover its own state after `save_queue` (see
+    `run_scheduler_loop`), not to seed a new invocation. This avoids the
+    account-N-changed-hands bug where a stale next_run_at from a different
+    login (e.g. a 4-day weekly-reset wait) got attached to a fresh usage
+    snapshot that no longer matched it.
 
-    Regardless of which path an account took above, every non-free_skip
-    account gets a fresh usage-limit lookup at startup (even if it already
-    carried usage fields from a saved queue) so the very first queue-status
-    print reflects current data instead of a possibly stale snapshot.
+    An account that fails the paid-plan gate becomes "free_skip" with
+    next_run_at set to the next plan re-check (now + plan_recheck_seconds).
+
+    For every other account, next_run_at is:
+    - `wait_until`, if given (explicit override), else
+    - `now + delay_seconds`, if `delay_seconds` > 0 (explicit override), else
+    - derived from the freshly fetched usage-limit fields via
+      `usage.compute_next_run(usage_fields, threshold, fallback_min, now)` —
+      the same reset-time-based calculation the loop itself uses after each
+      run, so the first schedule already reflects the account's real
+      current usage instead of "start after a fixed delay".
 
     get_tool: optional callable(account_id) -> "claude"|"codex" (normally
     `functools.partial(registry.get_tool, REGISTRY_PATH)`). Defaults to
@@ -202,9 +212,7 @@ def initialize_states(
     if get_tool is None:
         get_tool = lambda _account_id: "claude"
 
-    existing_states = existing_states or {}
     states: dict[int, AccountState] = {}
-    start_at = wait_until if wait_until is not None else now + delay_seconds
 
     for account_id in account_ids:
         tool = get_tool(account_id)
@@ -216,13 +224,16 @@ def initialize_states(
             continue
 
         usage_fields = _fetch_usage_fields(account_id, tool, plan)
-        saved = existing_states.get(account_id)
-        if saved is not None and saved.status in ("scheduled", "retry_pending"):
-            states[account_id] = dataclasses.replace(saved, tool=tool, **usage_fields)
-            continue
+
+        if wait_until is not None:
+            next_run_at = wait_until
+        elif delay_seconds > 0:
+            next_run_at = now + delay_seconds
+        else:
+            next_run_at = now + usage.compute_next_run(usage_fields, threshold, fallback_min, now)
 
         states[account_id] = AccountState(
-            next_run_at=start_at,
+            next_run_at=next_run_at,
             status="scheduled",
             tool=tool,
             **usage_fields,
@@ -623,14 +634,14 @@ def main(argv: list[str] | None = None) -> int:
 
     _share_claude_config_all()
 
-    existing_raw = load_queue(QUEUE_PATH)
-    try:
-        existing_states = state_from_dict(existing_raw)
-    except (TypeError, KeyError):
-        existing_states = {}
-
     states = initialize_states(
-        args.account_ids, wait_until_epoch, args.delay * 60, now, existing_states, get_tool
+        args.account_ids,
+        wait_until_epoch,
+        args.delay * 60,
+        now,
+        threshold=args.threshold,
+        fallback_min=args.interval,
+        get_tool=get_tool,
     )
 
     def run_claude_fn(account_id: int) -> bool:

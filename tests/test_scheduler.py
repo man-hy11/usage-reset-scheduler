@@ -104,7 +104,9 @@ def test_initialize_states_marks_free_account_as_free_skip(monkeypatch):
     _stub_usage_fetch(monkeypatch)
     monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
 
-    states = scheduler.initialize_states([1, 2], wait_until=None, delay_seconds=0, now=1000)
+    states = scheduler.initialize_states(
+        [1, 2], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
 
     assert states[2].status == "free_skip"
     assert states[2].next_run_at == 1000 + scheduler.PLAN_RECHECK_MIN * 60
@@ -115,7 +117,9 @@ def test_initialize_states_uses_wait_until_when_given(monkeypatch):
     monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
     _stub_usage_fetch(monkeypatch)
 
-    states = scheduler.initialize_states([1], wait_until=5000, delay_seconds=0, now=1000)
+    states = scheduler.initialize_states(
+        [1], wait_until=5000, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
 
     assert states[1].next_run_at == 5000
 
@@ -124,7 +128,9 @@ def test_initialize_states_uses_now_plus_delay_when_no_wait_until(monkeypatch):
     monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
     _stub_usage_fetch(monkeypatch)
 
-    states = scheduler.initialize_states([1], wait_until=None, delay_seconds=120, now=1000)
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=120, now=1000, threshold=100, fallback_min=5
+    )
 
     assert states[1].next_run_at == 1120
 
@@ -139,7 +145,9 @@ def test_initialize_states_fetches_usage_for_newly_scheduled_account(monkeypatch
         weekly_reset_at=1791073800,
     )
 
-    states = scheduler.initialize_states([1], wait_until=None, delay_seconds=0, now=1000)
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
 
     assert states[1].five_hour_used_percent == 42
     assert states[1].five_hour_reset_at == 1790496059
@@ -159,7 +167,9 @@ def test_initialize_states_does_not_fetch_usage_for_free_skip_account(monkeypatc
     monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
     monkeypatch.setattr(usage, "fetch_claude_usage", fail_if_called)
 
-    states = scheduler.initialize_states([2], wait_until=None, delay_seconds=0, now=1000)
+    states = scheduler.initialize_states(
+        [2], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
 
     assert states[2].status == "free_skip"
 
@@ -174,11 +184,106 @@ def test_initialize_states_leaves_usage_fields_none_when_fetch_fails(monkeypatch
 
     monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
 
-    states = scheduler.initialize_states([1], wait_until=None, delay_seconds=0, now=1000)
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
 
     assert states[1].status == "scheduled"
     assert states[1].five_hour_used_percent is None
     assert states[1].weekly_used_percent is None
+
+
+def test_initialize_states_derives_next_run_from_usage_when_no_override(monkeypatch):
+    # override(-w/-d) 없이 시작하면, 루프가 실행 후에 쓰는 것과 같은
+    # usage.compute_next_run() 계산을 시작 시에도 그대로 적용한다.
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    _stub_usage_fetch(
+        monkeypatch,
+        five_hour_used_percent=2,
+        five_hour_reset_at=1500,
+        weekly_used_percent=17,
+        weekly_reset_at=999999,
+    )
+
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
+
+    # 주간(17%) < threshold(100) → 5시간 리셋(1500)을 기준으로 잡는다.
+    assert states[1].next_run_at == 1500 + 60
+
+
+def test_initialize_states_targets_weekly_reset_when_over_threshold(monkeypatch):
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    _stub_usage_fetch(
+        monkeypatch,
+        five_hour_used_percent=0,
+        five_hour_reset_at=None,
+        weekly_used_percent=100,
+        weekly_reset_at=500000,
+    )
+
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
+
+    assert states[1].next_run_at == 500000 + 60
+
+
+def test_initialize_states_falls_back_to_interval_when_no_reset_data(monkeypatch):
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    _stub_usage_fetch(monkeypatch)  # 모든 한도 필드 None
+
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
+
+    assert states[1].next_run_at == 1000 + 5 * 60
+
+
+def test_initialize_states_wait_until_overrides_usage_based_calc(monkeypatch):
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    _stub_usage_fetch(monkeypatch, five_hour_used_percent=2, five_hour_reset_at=1500)
+
+    states = scheduler.initialize_states(
+        [1], wait_until=5000, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
+
+    assert states[1].next_run_at == 5000
+
+
+def test_initialize_states_delay_overrides_usage_based_calc(monkeypatch):
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    _stub_usage_fetch(monkeypatch, five_hour_used_percent=2, five_hour_reset_at=1500)
+
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=120, now=1000, threshold=100, fallback_min=5
+    )
+
+    assert states[1].next_run_at == 1120
+
+
+def test_initialize_states_ignores_any_saved_queue_and_recomputes_fresh(monkeypatch):
+    # 회귀 테스트: 계정 번호에 다른 사람이 로그인해도(=이메일이 바뀌어도)
+    # 예전 사람의 next_run_at을 물려받지 않는다 — 매번 완전히 새로 계산한다.
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    _stub_usage_fetch(
+        monkeypatch,
+        email="new-owner@example.com",
+        five_hour_used_percent=2,
+        five_hour_reset_at=1500,
+        weekly_used_percent=0,
+        weekly_reset_at=999999,
+    )
+
+    stale_next_run_at = 99_999_999  # 예전 계정 소유자 기준으로 저장돼 있던, 지금은 무관한 값
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
+
+    assert states[1].next_run_at != stale_next_run_at
+    assert states[1].next_run_at == 1500 + 60
+    assert states[1].email == "new-owner@example.com"
 
 
 def test_retry_pending_accounts_promotes_on_success(monkeypatch):
@@ -957,77 +1062,7 @@ def test_run_scheduler_loop_logs_exception_after_claude_run(monkeypatch, tmp_pat
     assert "post-run usage fetch boom" in captured.out
 
 
-# --- Fix 3: queue persistence across restarts ---
-
-
-def test_initialize_states_preserves_existing_retry_pending_when_still_paid(monkeypatch):
-    _stub_usage_fetch(monkeypatch)
-
-    existing_states = {
-        1: scheduler.AccountState(next_run_at=12345, status="retry_pending", fail_count=3),
-    }
-
-    states = scheduler.initialize_states(
-        [1], wait_until=None, delay_seconds=0, now=1000, existing_states=existing_states
-    )
-
-    assert states[1].status == "retry_pending"
-    assert states[1].next_run_at == 12345
-    assert states[1].fail_count == 3
-
-
-def test_initialize_states_preserves_existing_scheduled_when_still_paid(monkeypatch):
-    _stub_usage_fetch(monkeypatch)
-
-    existing_states = {
-        1: scheduler.AccountState(next_run_at=5000, status="scheduled", fail_count=0),
-    }
-
-    states = scheduler.initialize_states(
-        [1], wait_until=None, delay_seconds=0, now=1000, existing_states=existing_states
-    )
-
-    assert states[1].status == "scheduled"
-    assert states[1].next_run_at == 5000
-
-
-def test_initialize_states_demotes_saved_scheduled_account_that_turned_free(monkeypatch):
-    _stub_usage_fetch(monkeypatch)
-
-    def fake_check(account_id, tool="claude"):
-        raise accounts.AccountStatusError("유료 구독이 아님 (subscriptionType=free)")
-
-    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
-
-    existing_states = {
-        1: scheduler.AccountState(next_run_at=5000, status="scheduled", fail_count=0, plan="pro"),
-    }
-
-    states = scheduler.initialize_states(
-        [1], wait_until=None, delay_seconds=0, now=1000, existing_states=existing_states,
-        plan_recheck_seconds=600,
-    )
-
-    assert states[1].status == "free_skip"
-    assert states[1].next_run_at == 1600
-    assert states[1].plan is None
-
-
-def test_initialize_states_promotes_saved_free_skip_account_that_turned_paid(monkeypatch):
-    _stub_usage_fetch(monkeypatch, plan="max")
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "max")
-
-    existing_states = {
-        1: scheduler.AccountState(next_run_at=None, status="free_skip"),
-    }
-
-    states = scheduler.initialize_states(
-        [1], wait_until=None, delay_seconds=30, now=1000, existing_states=existing_states
-    )
-
-    assert states[1].status == "scheduled"
-    assert states[1].next_run_at == 1030
-    assert states[1].plan == "max"
+# --- 실행 중 루프의 구독 재확인(free_skip <-> scheduled 전환) ---
 
 
 class _StopLoop(Exception):
@@ -1108,69 +1143,30 @@ def test_run_scheduler_loop_rechecks_free_skip_and_runs_once_it_turns_paid(monke
     assert states[1].plan == "pro"
 
 
-def test_initialize_states_refreshes_usage_for_account_restored_from_saved_queue(monkeypatch):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
-    _stub_usage_fetch(
-        monkeypatch,
-        five_hour_used_percent=42,
-        five_hour_reset_at=1790496059,
-        weekly_used_percent=17,
-        weekly_reset_at=1791073800,
-    )
-
-    existing_states = {
-        1: scheduler.AccountState(
-            next_run_at=12345,
-            status="retry_pending",
-            fail_count=3,
-            five_hour_used_percent=1,
-            five_hour_reset_at=1,
-            weekly_used_percent=1,
-            weekly_reset_at=1,
-        ),
-    }
-
-    states = scheduler.initialize_states(
-        [1], wait_until=None, delay_seconds=0, now=1000, existing_states=existing_states
-    )
-
-    # 스케줄/재시도 이력은 그대로 이어받되(스펙 요구), 한도 필드는 시작 시점에 항상 새로 조회한다.
-    assert states[1].status == "retry_pending"
-    assert states[1].next_run_at == 12345
-    assert states[1].fail_count == 3
-    assert states[1].five_hour_used_percent == 42
-    assert states[1].five_hour_reset_at == 1790496059
-    assert states[1].weekly_used_percent == 17
-    assert states[1].weekly_reset_at == 1791073800
-
-
-def test_initialize_states_gate_checks_account_not_in_existing_states(monkeypatch):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
-    _stub_usage_fetch(monkeypatch)
-
-    states = scheduler.initialize_states(
-        [1], wait_until=None, delay_seconds=0, now=1000, existing_states={}
-    )
-
-    assert states[1].status == "scheduled"
-    assert states[1].next_run_at == 1000
-
-
-def test_main_loads_existing_queue_and_skips_paid_check_for_retry_pending_account(monkeypatch, tmp_path, capsys):
+def test_main_ignores_stale_saved_queue_and_recomputes_from_live_usage(monkeypatch, tmp_path, capsys):
+    # 회귀 테스트: 전에 이 계정 번호를 쓰던 사람의 스케줄(먼 미래의
+    # next_run_at)이 큐 파일에 남아 있어도, 새 스크립트 실행은 그걸 읽지
+    # 않고 지금 로그인된 계정의 실제 사용량으로 다시 계산한다.
     queue_path = tmp_path / "queue.json"
     scheduler.save_queue(
         queue_path,
         scheduler.state_to_dict(
-            {1: scheduler.AccountState(next_run_at=999999, status="retry_pending", fail_count=2)}
+            {1: scheduler.AccountState(next_run_at=99_999_999, status="scheduled", fail_count=0)}
         ),
     )
     monkeypatch.setattr(scheduler, "QUEUE_PATH", queue_path)
 
-    def fail_if_called(account_id):
-        raise AssertionError("check_paid_subscription should not be called for an account loaded from the queue")
+    checked = []
 
-    monkeypatch.setattr(accounts, "check_paid_subscription", fail_if_called)
-    _stub_usage_fetch(monkeypatch)
+    def fake_check(account_id, tool="claude"):
+        checked.append(account_id)
+        return "pro"
+
+    _stub_usage_fetch(
+        monkeypatch, five_hour_used_percent=2, five_hour_reset_at=1500, weekly_used_percent=0, weekly_reset_at=999999
+    )
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
+    monkeypatch.setattr(scheduler._time, "time", lambda: 1000)
 
     captured_states = {}
 
@@ -1182,9 +1178,10 @@ def test_main_loads_existing_queue_and_skips_paid_check_for_retry_pending_accoun
     rc = scheduler.main(["1"])
 
     assert rc == 0
-    assert captured_states[1].status == "retry_pending"
-    assert captured_states[1].next_run_at == 999999
-    assert captured_states[1].fail_count == 2
+    assert checked == [1]  # 큐에 저장돼 있다는 이유로 구독 확인을 건너뛰지 않는다
+    assert captured_states[1].status == "scheduled"
+    assert captured_states[1].next_run_at == 1500 + 60
+    assert captured_states[1].next_run_at != 99_999_999
 
 
 def test_state_from_dict_ignores_unknown_extra_key():
