@@ -528,6 +528,56 @@ def test_parse_args_account_management_short_flags():
     assert args.check_subscription is True
 
 
+def test_parse_args_count_option():
+    args = scheduler.parse_args(["--count", "6"])
+    assert args.count == 6
+    assert args.account_ids == []
+
+    args = scheduler.parse_args(["-n", "2"])
+    assert args.count == 2
+    assert args.account_ids == []
+
+
+def test_parse_args_count_rejects_explicit_account_ids():
+    with pytest.raises(SystemExit):
+        scheduler.parse_args(["1", "2", "--count", "3"])
+
+
+def test_parse_args_count_rejects_non_positive():
+    with pytest.raises(SystemExit):
+        scheduler.parse_args(["--count", "0"])
+    with pytest.raises(SystemExit):
+        scheduler.parse_args(["--count", "-1"])
+
+
+def test_select_paid_account_ids_skips_free_and_stops_at_count(monkeypatch):
+    free_ids = {2, 5}
+
+    def fake_check_paid_subscription(account_id, tool):
+        if account_id in free_ids:
+            raise accounts.AccountStatusError("유료 구독이 아님 (subscriptionType=free)")
+        return "pro"
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check_paid_subscription)
+
+    selected = scheduler.select_paid_account_ids(3, lambda _account_id: "claude", [1, 2, 3, 4, 5, 6])
+    assert selected == [1, 3, 4]
+
+
+def test_select_paid_account_ids_returns_fewer_than_count_when_exhausted(monkeypatch):
+    free_ids = {2, 5}
+
+    def fake_check_paid_subscription(account_id, tool):
+        if account_id in free_ids:
+            raise accounts.AccountStatusError("유료 구독이 아님 (subscriptionType=free)")
+        return "pro"
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check_paid_subscription)
+
+    selected = scheduler.select_paid_account_ids(10, lambda _account_id: "claude", [1, 2, 3, 4, 5, 6])
+    assert selected == [1, 3, 4, 6]
+
+
 def test_build_claude_command_shape():
     cmd = scheduler.build_claude_command("claude-haiku-4-5", "low", "Reply with OK.")
     assert cmd == [

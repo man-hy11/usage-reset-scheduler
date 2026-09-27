@@ -178,6 +178,26 @@ def _check_plan(account_id: int, tool: str) -> str | None:
         return None
 
 
+def select_paid_account_ids(count: int, get_tool, registered_ids: list[int]) -> list[int]:
+    """`registered_ids`를 오름차순으로 훑으며, 유료 구독인 계정만 최대 `count`개 고른다.
+
+    `--count`/`-n`용 선택 로직. 각 계정을 실시간으로 `check_paid_subscription`
+    확인하므로(캐시된 queue.json 상태는 보지 않음 — `initialize_states`와 동일한
+    이유, docstring 참고) 계정 수만큼 API 호출이 들어갈 수 있다. free 계정은
+    건너뛰고 다음 계정을 확인한다. 등록된 계정을 다 훑어도 `count`개를 채우지
+    못하면 찾은 만큼만 반환한다.
+    """
+    selected: list[int] = []
+    for account_id in sorted(registered_ids):
+        if len(selected) >= count:
+            break
+        tool = get_tool(account_id)
+        if _check_plan(account_id, tool) is None:
+            continue
+        selected.append(account_id)
+    return selected
+
+
 def initialize_states(
     account_ids: list[int],
     wait_until: int | None,
@@ -426,8 +446,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("-a", "--add-account", type=int, default=None)
     parser.add_argument("-l", "--list-accounts", action="store_true", default=False)
     parser.add_argument("-r", "--remove-account", type=int, default=None)
+    parser.add_argument(
+        "-n", "--count", type=int, default=None,
+        help="계정 번호를 나열하는 대신, 등록된 계정 중 유료 구독인 계정을 1번부터 순서대로 최대 N개 자동 선택합니다. "
+             "명시적 account_ids와 함께 쓸 수 없습니다.",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.count is not None:
+        if args.account_ids:
+            parser.error("account_ids와 --count/-n은 함께 쓸 수 없습니다.")
+        if args.count <= 0:
+            parser.error("--count/-n은 1 이상이어야 합니다.")
+        args.account_ids = []
+        return args
+
     if not args.account_ids:
         args.account_ids = [1]
     else:
@@ -613,6 +647,19 @@ def main(argv: list[str] | None = None) -> int:
 
     def get_tool(account_id: int) -> str:
         return registry.get_tool(REGISTRY_PATH, account_id)
+
+    if args.count is not None:
+        registered_ids = list(registry.load_registry(REGISTRY_PATH).keys())
+        args.account_ids = select_paid_account_ids(args.count, get_tool, registered_ids)
+        if not args.account_ids:
+            print("--count/-n: 유료 구독인 등록된 계정이 없습니다.", file=sys.stderr)
+            return 1
+        if len(args.account_ids) < args.count:
+            print(
+                f"--count/-n: 유료 구독 계정 {len(args.account_ids)}개만 찾았습니다 "
+                f"(요청 {args.count}개, 등록된 계정 {len(registered_ids)}개): "
+                + ", ".join(f"user{i}" for i in args.account_ids)
+            )
 
     if args.add_account is not None:
         tool = prompt_for_tool()

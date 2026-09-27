@@ -20,6 +20,11 @@ python3 scheduler.py
 # 각 계정은 claude일 수도 codex일 수도 있다 — 등록된 도구를 따른다
 python3 scheduler.py 1 2 3 4
 
+# 계정 번호를 나열하는 대신, 등록된 계정 중 유료 구독인 계정을 1번부터
+# 순서대로 최대 N개 자동 선택 (등록이 4개면 4개까지, 6개면 6개까지;
+# free 계정은 건너뛰고 다음 번호를 확인). account_ids와 함께 쓸 수 없음
+python3 scheduler.py --count 6   # 또는: python3 scheduler.py -n 6
+
 # 특정 시각에 최초 실행 시작
 python3 scheduler.py 1 -w "14:00"
 python3 scheduler.py 1 -w "2026-10-01 09:00"
@@ -142,6 +147,7 @@ python3 scheduler.py [계정번호 ...] [옵션]
 | `--add-account N` | `-a` | — | `userN` 등록/재로그인 (N은 2 이상). 도구를 대화형으로 선택 |
 | `--list-accounts` | `-l` | — | 등록 계정, 도구, 구독 상태 표시 |
 | `--remove-account N` | `-r` | — | `userN`을 백업 이름으로 이동 (복구 가능, `user1`은 불가) |
+| `--count N` | `-n` | — | 계정 번호 나열 대신, 등록된 계정을 1번부터 순서대로 실시간 확인해 유료 구독 계정만 최대 N개 자동 선택. 등록된 계정이 N개보다 적으면 있는 만큼만 선택. 명시적 계정번호와 함께 쓸 수 없음 |
 
 계정 번호를 여러 개 지정하면 중복은 제거되고 처음 등장한 순서가 유지됩니다. `--model`/`--effort`를 명시하면 그 실행에 포함된 **모든** 계정(도구 무관)에 동일하게 적용됩니다 — claude와 codex를 같은 실행에 섞을 때 서로 다른 모델을 강제로 맞추고 싶은 게 아니라면 보통 생략하는 편이 안전합니다.
 
