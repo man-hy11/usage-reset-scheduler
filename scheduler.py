@@ -205,10 +205,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("-d", "--delay", type=int, default=0)
     parser.add_argument("--interval", type=int, default=5)
     parser.add_argument("--threshold", type=int, default=100)
-    parser.add_argument("--check-subscription", action="store_true", default=False)
-    parser.add_argument("--add-account", type=int, default=None)
-    parser.add_argument("--list-accounts", action="store_true", default=False)
-    parser.add_argument("--remove-account", type=int, default=None)
+    parser.add_argument("-c", "--check-subscription", action="store_true", default=False)
+    parser.add_argument("-a", "--add-account", type=int, default=None)
+    parser.add_argument("-l", "--list-accounts", action="store_true", default=False)
+    parser.add_argument("-r", "--remove-account", type=int, default=None)
 
     args = parser.parse_args(argv)
     if not args.account_ids:

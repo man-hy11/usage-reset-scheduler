@@ -241,6 +241,20 @@ def test_parse_args_account_management_flags():
     assert args.remove_account == 3
 
 
+def test_parse_args_account_management_short_flags():
+    args = scheduler.parse_args(["-a", "5"])
+    assert args.add_account == 5
+
+    args = scheduler.parse_args(["-l"])
+    assert args.list_accounts is True
+
+    args = scheduler.parse_args(["-r", "3"])
+    assert args.remove_account == 3
+
+    args = scheduler.parse_args(["1", "-c"])
+    assert args.check_subscription is True
+
+
 def test_build_claude_command_shape():
     cmd = scheduler.build_claude_command("claude-haiku-4-5", "low", "Reply with OK.")
     assert cmd == [
