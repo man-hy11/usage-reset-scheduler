@@ -37,6 +37,7 @@ class AccountState:
     email: str | None = None
     plan: str | None = None  # 예: "pro", "max", "plus" — check_paid_subscription 결과
     tool: str = "claude"  # "claude" | "codex"
+    last_run_at: int | None = None  # 마지막 실행을 시작(dispatch)한 시각
 
 
 def state_to_dict(states: dict[int, AccountState]) -> dict:
@@ -84,15 +85,21 @@ def format_queue_summary(states: dict[int, AccountState]) -> str:
 
         if state.status == "free_skip":
             lines.append("  상태: free_skip")
+            if state.last_run_at is not None:
+                lines.append(f"  최근 실행: {_format_when(state.last_run_at)}")
             if state.next_run_at is not None:
                 lines.append(f"  다음 구독 확인: {_format_when(state.next_run_at)}")
             continue
 
         if state.status == "retry_pending":
             lines.append(f"  상태: retry_pending (실패 {state.fail_count}회)")
+            if state.last_run_at is not None:
+                lines.append(f"  최근 실행: {_format_when(state.last_run_at)}")
             lines.append(f"  다음 재시도: {_format_when(state.next_run_at)}")
         else:
             lines.append(f"  상태: {state.status}")
+            if state.last_run_at is not None:
+                lines.append(f"  최근 실행: {_format_when(state.last_run_at)}")
             lines.append(f"  다음 실행: {_format_when(state.next_run_at)}")
 
         if state.five_hour_used_percent is not None and state.five_hour_reset_at is not None:
@@ -216,10 +223,14 @@ def initialize_states(
 
     for account_id in account_ids:
         tool = get_tool(account_id)
+        last_run_at = last_logged_run_at(account_id, tool)
         plan = _check_plan(account_id, tool)
         if plan is None:
             states[account_id] = AccountState(
-                next_run_at=now + plan_recheck_seconds, status="free_skip", tool=tool
+                next_run_at=now + plan_recheck_seconds,
+                status="free_skip",
+                tool=tool,
+                last_run_at=last_run_at,
             )
             continue
 
@@ -236,6 +247,7 @@ def initialize_states(
             next_run_at=next_run_at,
             status="scheduled",
             tool=tool,
+            last_run_at=last_run_at,
             **usage_fields,
         )
 
@@ -334,6 +346,7 @@ def run_scheduler_loop(
                 next_run_at=checked_at + plan_recheck_min * 60,
                 status="free_skip",
                 tool=current.tool,
+                last_run_at=current.last_run_at,
             )
             save_queue(queue_path, state_to_dict(states))
             push_all()
@@ -344,6 +357,7 @@ def run_scheduler_loop(
                 next_run_at=checked_at,
                 status="scheduled",
                 tool=current.tool,
+                last_run_at=current.last_run_at,
                 **_fetch_usage_fields(account_id, current.tool, plan),
             )
             save_queue(queue_path, state_to_dict(states))
@@ -351,6 +365,8 @@ def run_scheduler_loop(
             continue
         current.plan = plan
 
+        # 몇 시에 실행을 *시작*했나가 목적이므로 완료 시각이 아닌 dispatch 시각을 남긴다.
+        current.last_run_at = checked_at
         success = run_claude_fn(account_id)
         if not success:
             print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] claude 호출 실패")
@@ -359,6 +375,7 @@ def run_scheduler_loop(
         tool = states[account_id].tool
         email = states[account_id].email
         plan = states[account_id].plan
+        last_run_at = current.last_run_at
         try:
             status = fetch_usage(account_id, tool)
             seconds = usage.compute_next_run(status, threshold, fallback_min, run_after)
@@ -373,6 +390,7 @@ def run_scheduler_loop(
                 email=email,
                 plan=plan,
                 tool=tool,
+                last_run_at=last_run_at,
             )
         except Exception as exc:
             print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 사용량 조회 실패: {exc!r}")
@@ -383,6 +401,7 @@ def run_scheduler_loop(
                 email=email,
                 plan=plan,
                 tool=tool,
+                last_run_at=last_run_at,
             )
 
         save_queue(queue_path, state_to_dict(states))
@@ -458,6 +477,30 @@ def log_dir_for_account(account_id: int, tool: str = "claude") -> Path:
     return log_dir
 
 
+def last_logged_run_at(account_id: int, tool: str = "claude") -> int | None:
+    """가장 최근 실행 로그의 시각. 실행 기록이 없으면 None.
+
+    로그 파일명에 실행 시각이 들어 있으므로 mtime 대신 파일명을 본다. 로그를
+    백업했다가 되돌리면 mtime은 복사 시각으로 덮어써지기 때문이다.
+    """
+    log_dir = accounts.account_dir(account_id, tool) / "start-limit-runs"
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return None
+
+    stamps = []
+    for name in names:
+        if not (name.startswith("loop-") and name.endswith(".log")):
+            continue
+        try:
+            parsed = datetime.strptime(name[5:-4], "%Y%m%d-%H%M%S")
+        except ValueError:
+            continue
+        stamps.append(int(parsed.timestamp()))
+    return max(stamps) if stamps else None
+
+
 def _extract_claude_text(stdout: str) -> str:
     text_parts = []
     for line in stdout.splitlines():
@@ -497,11 +540,13 @@ def _extract_codex_text(stdout: str) -> str:
 
 
 def _run_and_log(account_id: int, tool: str, cmd: list[str], env: dict, extract_text) -> bool:
+    # last_logged_run_at()이 이 파일명에서 dispatch 시각을 복원하므로, 완료 후가
+    # 아니라 subprocess.run() 이전에 타임스탬프를 찍는다.
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     completed = subprocess.run(cmd, env=env, capture_output=True, text=True)
     output_text = extract_text(completed.stdout)
 
     log_dir = log_dir_for_account(account_id, tool)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_file = log_dir / f"loop-{timestamp}.log"
     log_file.write_text(output_text)
 

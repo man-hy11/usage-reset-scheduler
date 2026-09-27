@@ -1417,3 +1417,328 @@ def test_run_scheduler_loop_prints_queue_summary_each_iteration(monkeypatch, tmp
     assert "user1" in captured.out
     assert "user2" in captured.out
     assert captured.out.count("상태: scheduled") >= 2
+
+
+# --- 최근 실행 시각 표시 -------------------------------------------------------
+# 실사례: 큐 상태에 "다음 실행"만 있어서 그 계정이 마지막으로 실제 실행된
+# 시각을 알 수 없었다. 상태에 기록된 실행 시각을 함께 보여준다.
+
+
+def _stamp_line(label, epoch):
+    return f"  {label}: {datetime.fromtimestamp(epoch).strftime('%Y-%m-%d %H:%M:%S')}"
+
+
+def test_format_queue_summary_shows_last_run_for_scheduled_account():
+    last_run_at = 1790496059
+    states = {
+        1: scheduler.AccountState(
+            next_run_at=last_run_at + 3600, status="scheduled", last_run_at=last_run_at
+        ),
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert _stamp_line("최근 실행", last_run_at) in summary.splitlines()
+
+
+def test_format_queue_summary_shows_last_run_for_free_skip_account():
+    last_run_at = 1790496059
+    states = {
+        2: scheduler.AccountState(
+            next_run_at=last_run_at + 600, status="free_skip", last_run_at=last_run_at
+        ),
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert _stamp_line("최근 실행", last_run_at) in summary.splitlines()
+
+
+def test_format_queue_summary_orders_last_run_between_status_and_next_run():
+    last_run_at = 1790496059
+    next_run_at = last_run_at + 3600
+    states = {
+        1: scheduler.AccountState(
+            next_run_at=next_run_at, status="scheduled", last_run_at=last_run_at
+        ),
+    }
+
+    lines = scheduler.format_queue_summary(states).splitlines()
+
+    assert lines.index(_stamp_line("최근 실행", last_run_at)) > lines.index("  상태: scheduled")
+    assert lines.index(_stamp_line("다음 실행", next_run_at)) > lines.index(
+        _stamp_line("최근 실행", last_run_at)
+    )
+
+
+def test_format_queue_summary_omits_last_run_when_never_run():
+    states = {
+        1: scheduler.AccountState(next_run_at=1790496059, status="scheduled"),
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert "최근 실행" not in summary
+
+
+# --- 로그 파일명으로 실행 시각 복원 -------------------------------------------
+
+
+def _write_run_log(account_root, stamp):
+    log_dir = account_root / "start-limit-runs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"loop-{stamp}.log").write_text("output")
+
+
+def test_last_logged_run_at_reads_timestamp_from_log_filename(monkeypatch, tmp_path):
+    _write_run_log(tmp_path, "20260927-221425")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path)
+
+    expected = int(datetime.strptime("20260927-221425", "%Y%m%d-%H%M%S").timestamp())
+
+    assert scheduler.last_logged_run_at(2, "claude") == expected
+
+
+def test_last_logged_run_at_prefers_newest_filename_over_file_mtime(monkeypatch, tmp_path):
+    # 로그를 백업했다가 되돌리면 mtime은 복사 시각으로 바뀐다. 실행 시각의
+    # 원본 기록은 파일명에 있으므로 파일명을 신뢰한다.
+    newest = tmp_path / "start-limit-runs" / "loop-20260927-221425.log"
+    oldest = tmp_path / "start-limit-runs" / "loop-20260927-160554.log"
+    oldest.parent.mkdir(parents=True)
+    newest.write_text("newest run")
+    oldest.write_text("older run")
+
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path)
+
+    expected = int(datetime.strptime("20260927-221425", "%Y%m%d-%H%M%S").timestamp())
+
+    assert scheduler.last_logged_run_at(2, "claude") == expected
+    assert newest.stat().st_mtime < oldest.stat().st_mtime
+
+
+def test_last_logged_run_at_returns_none_when_log_dir_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path / "nope")
+
+    assert scheduler.last_logged_run_at(9, "claude") is None
+
+
+def test_last_logged_run_at_ignores_unrelated_and_malformed_filenames(monkeypatch, tmp_path):
+    log_dir = tmp_path / "start-limit-runs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "notes.txt").write_text("x")
+    (log_dir / "loop-not-a-timestamp.log").write_text("x")
+    (log_dir / "loop-20260927-221425.log").write_text("ok")
+
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path)
+
+    expected = int(datetime.strptime("20260927-221425", "%Y%m%d-%H%M%S").timestamp())
+
+    assert scheduler.last_logged_run_at(1, "claude") == expected
+
+
+def test_initialize_states_recovers_last_run_at_from_run_log(monkeypatch, tmp_path):
+    # 재시작할 때마다 상태를 처음부터 다시 계산하므로, 직전 실행 시각이
+    # 사라지지 않으려면 실행 로그에서 복원해야 한다.
+    _write_run_log(tmp_path, "20260927-221425")
+    _stub_usage_fetch(monkeypatch)
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path)
+
+    expected = int(datetime.strptime("20260927-221425", "%Y%m%d-%H%M%S").timestamp())
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
+
+    assert states[1].last_run_at == expected
+
+
+def test_initialize_states_leaves_last_run_at_none_without_run_log(monkeypatch, tmp_path):
+    _stub_usage_fetch(monkeypatch)
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path)
+
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, threshold=100, fallback_min=5
+    )
+
+    assert states[1].last_run_at is None
+
+
+# --- 실행 시각 기록과 재구성 시 유지 -------------------------------------------
+
+
+def test_run_scheduler_loop_records_dispatch_time_not_completion_time(monkeypatch, tmp_path):
+    # "몇 시에 실행됐나"가 목적이므로, 완료 시각이 아니라 시작(dispatch) 시각이어야 한다.
+    _stub_usage_fetch(monkeypatch)
+    monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 999999)
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+
+    states = {1: scheduler.AccountState(next_run_at=100, status="scheduled")}
+    now_box = {"t": 100}
+
+    def fake_run_claude(account_id):
+        now_box["t"] += 60  # 실행에 60초가 걸린 상황
+        raise _StopLoop()
+
+    def fake_sleep(seconds):
+        now_box["t"] += seconds
+
+    with pytest.raises(_StopLoop):
+        scheduler.run_scheduler_loop(
+            states,
+            interval_min=5,
+            threshold=100,
+            fallback_min=305,
+            run_claude_fn=fake_run_claude,
+            sleep_fn=fake_sleep,
+            now_fn=lambda: now_box["t"],
+            queue_path=tmp_path / "queue.json",
+        )
+
+    # 시계는 이미 160으로 넘어갔지만 기록된 값은 실행을 시작한 100이어야 한다.
+    assert now_box["t"] == 160
+    assert states[1].last_run_at == 100
+
+
+def test_run_scheduler_loop_keeps_last_run_at_after_rebuilding_state(monkeypatch, tmp_path):
+    # 실행이 끝나면 상태 객체가 통째로 새로 만들어진다. 그동안 최근 실행
+    # 시각이 유실되면 안 된다.
+    _stub_usage_fetch(monkeypatch)
+    monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 999999)
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+
+    states = {
+        1: scheduler.AccountState(next_run_at=100, status="scheduled"),
+        2: scheduler.AccountState(next_run_at=200, status="scheduled"),
+    }
+    calls = []
+
+    def fake_run_claude(account_id):
+        calls.append(account_id)
+        if len(calls) == 2:
+            raise _StopLoop()
+        return True
+
+    _run_loop_with_fake_clock(states, tmp_path, fake_run_claude)
+
+    assert calls == [1, 2]
+    assert states[1].last_run_at == 100
+
+
+def test_run_scheduler_loop_promotion_from_free_skip_preserves_previous_last_run_at(monkeypatch, tmp_path):
+    # free_skip에서 유료로 전환되어 scheduled로 승격되는 그 순간(아직 재실행 전),
+    # 이전에 기록돼 있던 last_run_at이 유실되지 않고 새 state 객체로 옮겨져야 한다.
+    _stub_usage_fetch(monkeypatch)
+
+    checks = {"n": 0}
+
+    def fake_check(account_id, tool="claude"):
+        checks["n"] += 1
+        if checks["n"] >= 2:
+            # 승격 커밋 직후, 재선택되어 dispatch 전에 다시 확인하는 두 번째
+            # _check_plan 호출 시점에 멈춘다 — 아직 last_run_at을 덮어쓰기 전이다.
+            raise _StopLoop()
+        return "pro"
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
+
+    states = {1: scheduler.AccountState(next_run_at=100, status="free_skip", last_run_at=42)}
+
+    def fake_run_claude(account_id):
+        raise AssertionError("dispatch까지 도달하면 안 된다 — 승격 직후 상태를 보는 테스트다")
+
+    _run_loop_with_fake_clock(states, tmp_path, fake_run_claude)
+
+    assert states[1].status == "scheduled"
+    assert states[1].last_run_at == 42
+
+
+def test_run_scheduler_loop_keeps_last_run_at_when_usage_fetch_fails(monkeypatch, tmp_path):
+    # 실행은 성공했지만 실행 후 사용량 조회가 실패해 retry_pending으로 내려갈 때도
+    # last_run_at(이번 dispatch 시각)이 유실되면 안 된다.
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_email", lambda account_id, tool="claude": None)
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+
+    def fake_fetch_claude_usage(config_dir):
+        raise RuntimeError("사용량 조회 실패(테스트)")
+
+    monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch_claude_usage)
+
+    states = {1: scheduler.AccountState(next_run_at=100, status="scheduled", plan="pro", last_run_at=None)}
+
+    def fake_run_claude(account_id):
+        return True
+
+    def fake_now():
+        return 100
+
+    call_count = {"n": 0}
+
+    def fake_sleep(seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= 2:
+            raise _StopLoop()
+
+    with pytest.raises(_StopLoop):
+        scheduler.run_scheduler_loop(
+            states,
+            interval_min=5,
+            threshold=100,
+            fallback_min=305,
+            run_claude_fn=fake_run_claude,
+            sleep_fn=fake_sleep,
+            now_fn=fake_now,
+            queue_path=tmp_path / "queue.json",
+        )
+
+    assert states[1].status == "retry_pending"
+    assert states[1].last_run_at == 100
+
+
+def test_run_scheduler_loop_keeps_last_run_at_when_demoted_to_free_skip(monkeypatch, tmp_path):
+    _stub_usage_fetch(monkeypatch, weekly_used_percent=1, five_hour_reset_at=99999)
+    monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 999999)
+
+    def fake_check(account_id, tool="claude"):
+        if account_id == 1:
+            raise accounts.AccountStatusError("유료 구독이 아님 (subscriptionType=free)")
+        return "pro"
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
+
+    states = {
+        1: scheduler.AccountState(
+            next_run_at=100, status="scheduled", plan="pro", last_run_at=42
+        ),
+        2: scheduler.AccountState(next_run_at=200, status="scheduled"),
+    }
+
+    def fake_run_claude(account_id):
+        raise _StopLoop()
+
+    _run_loop_with_fake_clock(states, tmp_path, fake_run_claude)
+
+    assert states[1].status == "free_skip"
+    assert states[1].last_run_at == 42
+
+
+def test_run_scheduler_loop_summary_shows_last_run_after_first_run(monkeypatch, tmp_path, capsys):
+    _stub_usage_fetch(monkeypatch)
+    monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 999999)
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+
+    states = {
+        1: scheduler.AccountState(next_run_at=100, status="scheduled"),
+        2: scheduler.AccountState(next_run_at=200, status="scheduled"),
+    }
+    calls = []
+
+    def fake_run_claude(account_id):
+        calls.append(account_id)
+        if len(calls) == 2:
+            raise _StopLoop()
+        return True
+
+    _run_loop_with_fake_clock(states, tmp_path, fake_run_claude)
+
+    captured = capsys.readouterr()
+    assert _stamp_line("최근 실행", 100) in captured.out.splitlines()
