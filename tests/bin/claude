@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [[ "${1:-}" == "auth" && "${2:-}" == "status" && "${3:-}" == "--json" ]]; then
+  if [[ "${CLAUDE_AUTH_STATUS_EXIT:-0}" != "0" ]]; then
+    exit "$CLAUDE_AUTH_STATUS_EXIT"
+  fi
+  status_json="${CLAUDE_AUTH_STATUS_JSON-}"
+  if [[ -z "$status_json" ]]; then
+    case "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" in
+      */.claude) status_json='{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"pro"}' ;;
+      */.claude-account-2) status_json='{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"free"}' ;;
+      */.claude-account-3) status_json='{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}' ;;
+      *) status_json='{"loggedIn":false,"authMethod":"none","subscriptionType":null}' ;;
+    esac
+  fi
+  printf '%s\n' "$status_json"
+  exit 0
+fi
+
+if [[ "${1:-}" == "auth" && "${2:-}" == "login" ]]; then
+  printf 'LOGIN:%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  exit 0
+fi
+
+echo "테스트 중 예기치 않은 Claude 모델 호출: $*" >&2
+exit 99
