@@ -30,7 +30,9 @@ PAID_PLANS = {"pro", "max", "team", "enterprise"}
 
 # 스케줄러 계정이 ~/.claude(사용자가 직접 쓰는 설정)와 공유하는 항목.
 # 계정 폴더 안에 원본으로의 심볼릭 링크를 두므로 ~/.claude 쪽 변경이 모든
-# 계정에 즉시 반영된다. 인증·세션·히스토리 등 계정별 상태는 공유하지 않는다.
+# 계정에 즉시 반영된다. projects(세션 히스토리)도 공유되므로 `claude --resume`은
+# 어느 계정으로 열든 동일한 세션 목록을 본다. 인증정보(.credentials.json,
+# .claude.json)만 계정별로 분리되어 공유하지 않는다.
 SHARED_CLAUDE_ENTRIES = (
     "settings.json",
     "CLAUDE.md",
@@ -41,6 +43,7 @@ SHARED_CLAUDE_ENTRIES = (
     "hud",
     "statusline",
     "statusline-command.sh",
+    "projects",
 )
 
 CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
