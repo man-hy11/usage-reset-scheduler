@@ -1,4 +1,6 @@
 import heapq
+import json as _json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -202,3 +204,227 @@ def test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order(monkeypat
 
     assert call_order == [2, 1]
     assert sleep_calls == [0, 100]  # account2: 100-100=0 대기, account1: 200-100=100 대기
+
+
+def test_parse_args_defaults_to_account_1_when_none_given():
+    args = scheduler.parse_args([])
+    assert args.account_ids == [1]
+    assert args.model == "claude-haiku-4-5"
+    assert args.effort == "low"
+    assert args.interval == 5
+    assert args.threshold == 100
+    assert args.delay == 0
+    assert args.check_subscription is False
+
+
+def test_parse_args_accepts_multiple_account_ids():
+    args = scheduler.parse_args(["1", "2", "3"])
+    assert args.account_ids == [1, 2, 3]
+
+
+def test_parse_args_parses_wait_until_and_options():
+    args = scheduler.parse_args(["2", "-w", "14:00", "--model", "opus", "--effort", "high"])
+    assert args.account_ids == [2]
+    assert args.wait_until == "14:00"
+    assert args.model == "opus"
+    assert args.effort == "high"
+
+
+def test_parse_args_account_management_flags():
+    args = scheduler.parse_args(["--add-account", "5"])
+    assert args.add_account == 5
+
+    args = scheduler.parse_args(["--list-accounts"])
+    assert args.list_accounts is True
+
+    args = scheduler.parse_args(["--remove-account", "3"])
+    assert args.remove_account == 3
+
+
+def test_build_claude_command_shape():
+    cmd = scheduler.build_claude_command("claude-haiku-4-5", "low", "Reply with OK.")
+    assert cmd == [
+        "claude",
+        "--dangerously-skip-permissions",
+        "--model", "claude-haiku-4-5",
+        "--effort", "low",
+        "-p",
+        "--output-format", "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "Reply with OK.",
+    ]
+
+
+def test_run_claude_extracts_text_deltas_and_returns_true_on_success(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: tmp_path / f"acct{account_id}")
+
+    stream_lines = [
+        _json.dumps({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "OK"}}}),
+        _json.dumps({"type": "other"}),
+    ]
+
+    class _FakeCompletedProcess:
+        def __init__(self):
+            self.stdout = "\n".join(stream_lines) + "\n"
+            self.returncode = 0
+
+    def fake_run(cmd, env, capture_output, text):
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(scheduler, "subprocess", subprocess)
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id: log_dir)
+
+    result = scheduler.run_claude(1, "claude-haiku-4-5", "low")
+
+    assert result is True
+    logged_files = list(log_dir.glob("loop-*.log"))
+    assert len(logged_files) == 1
+    assert logged_files[0].read_text() == "OK"
+
+
+def test_run_claude_returns_false_on_nonzero_exit(monkeypatch, tmp_path):
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: tmp_path / f"acct{account_id}")
+
+    class _FakeCompletedProcess:
+        def __init__(self):
+            self.stdout = ""
+            self.returncode = 1
+
+    monkeypatch.setattr(subprocess, "run", lambda cmd, env, capture_output, text: _FakeCompletedProcess())
+    monkeypatch.setattr(scheduler, "subprocess", subprocess)
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id: log_dir)
+
+    result = scheduler.run_claude(1, "claude-haiku-4-5", "low")
+
+    assert result is False
+
+
+def test_main_check_subscription_prints_plan_and_returns_zero(monkeypatch, capsys):
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+
+    rc = scheduler.main(["1", "--check-subscription"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "pro" in captured.out
+
+
+def test_main_check_subscription_reports_skip_for_free_plan(monkeypatch, capsys):
+    def fake_check(account_id):
+        raise accounts.AccountStatusError("유료 Claude 구독이 아님 (subscriptionType=free)")
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
+
+    rc = scheduler.main(["2", "--check-subscription"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "SKIP" in captured.out
+
+
+def test_main_list_accounts_routes_to_accounts_module(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(
+        accounts,
+        "list_accounts",
+        lambda: [(1, "pro", tmp_path / ".claude")],
+    )
+
+    rc = scheduler.main(["--list-accounts"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "user1" in captured.out
+    assert "pro" in captured.out
+
+
+def test_main_add_account_routes_to_accounts_module(monkeypatch):
+    called = {}
+
+    def fake_add(account_id):
+        called["account_id"] = account_id
+
+    monkeypatch.setattr(accounts, "add_account", fake_add)
+
+    rc = scheduler.main(["--add-account", "5"])
+
+    assert rc == 0
+    assert called["account_id"] == 5
+
+
+def test_main_remove_account_routes_to_accounts_module(monkeypatch, capsys):
+    monkeypatch.setattr(accounts, "remove_account", lambda account_id: Path("/fake/backup"))
+
+    rc = scheduler.main(["--remove-account", "2"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "backup" in captured.out
+
+
+def test_main_remove_account_1_returns_nonzero(monkeypatch, capsys):
+    def fake_remove(account_id):
+        raise ValueError("user1은 제거할 수 없습니다")
+
+    monkeypatch.setattr(accounts, "remove_account", fake_remove)
+
+    rc = scheduler.main(["--remove-account", "1"])
+
+    captured = capsys.readouterr()
+    assert rc != 0
+    assert "user1은 제거할 수 없습니다" in captured.err
+
+
+def test_main_rejects_past_wait_until_without_entering_loop(monkeypatch, capsys):
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("과거 --wait-until인데 스케줄러 루프가 시작됨")
+
+    monkeypatch.setattr(scheduler, "run_scheduler_loop", fail_if_called)
+
+    rc = scheduler.main(["1", "--wait-until", "2000-01-01 00:00"])
+
+    captured = capsys.readouterr()
+    assert rc != 0
+    assert "이미 과거" in captured.err
+
+
+def test_parse_wait_until_hh_mm_format_resolves_to_today():
+    from datetime import datetime
+
+    fixed_now_dt = datetime(2026, 9, 27, 9, 0, 0)
+    now_epoch = int(fixed_now_dt.timestamp())
+
+    epoch = scheduler._parse_wait_until("23:59", now_epoch)
+    parsed = datetime.fromtimestamp(epoch)
+    assert (parsed.year, parsed.month, parsed.day, parsed.hour, parsed.minute) == (2026, 9, 27, 23, 59)
+
+
+def test_parse_wait_until_full_datetime_format():
+    from datetime import datetime
+
+    now_epoch = int(datetime(2026, 1, 1, 0, 0, 0).timestamp())
+    epoch = scheduler._parse_wait_until("2026-12-31 08:00", now_epoch)
+    parsed = datetime.fromtimestamp(epoch)
+    assert (parsed.year, parsed.month, parsed.day, parsed.hour, parsed.minute) == (2026, 12, 31, 8, 0)
+
+
+def test_parse_wait_until_invalid_format_raises():
+    with pytest.raises(ValueError):
+        scheduler._parse_wait_until("not-a-time", now=1_000_000)
+
+
+def test_parse_wait_until_past_time_raises():
+    from datetime import datetime
+
+    now_epoch = int(datetime(2026, 9, 27, 23, 0, 0).timestamp())
+    with pytest.raises(ValueError, match="이미 과거"):
+        scheduler._parse_wait_until("09:00", now_epoch)
