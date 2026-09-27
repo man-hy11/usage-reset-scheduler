@@ -44,6 +44,21 @@ def state_from_dict(raw: dict) -> dict[int, AccountState]:
     return result
 
 
+def format_queue_summary(states: dict[int, AccountState]) -> str:
+    parts = []
+    for account_id in sorted(states):
+        state = states[account_id]
+        if state.status == "free_skip":
+            parts.append(f"user{account_id}(free_skip)")
+        elif state.status == "retry_pending":
+            when = datetime.fromtimestamp(state.next_run_at).strftime("%H:%M:%S")
+            parts.append(f"user{account_id}(retry_pending, 다음 {when}, 실패 {state.fail_count}회)")
+        else:
+            when = datetime.fromtimestamp(state.next_run_at).strftime("%H:%M:%S")
+            parts.append(f"user{account_id}({state.status}, 다음 {when})")
+    return "큐 상태: " + " ".join(parts)
+
+
 def load_queue(path: Path) -> dict:
     try:
         with open(path) as f:
@@ -156,6 +171,7 @@ def run_scheduler_loop(
         now = now_fn()
         retry_pending_accounts(states, interval_min, threshold, fallback_min, now)
         save_queue(queue_path, state_to_dict(states))
+        print(format_queue_summary(states))
 
         current = states[account_id]
         if current.status != "scheduled" or current.next_run_at != next_run_at:

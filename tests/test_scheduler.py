@@ -746,3 +746,83 @@ def test_main_rejects_negative_interval_without_entering_loop(monkeypatch, capsy
     captured = capsys.readouterr()
     assert rc != 0
     assert captured.err
+
+
+# --- Queue status printing ---
+
+
+def test_format_queue_summary_shows_each_account_status():
+    states = {
+        1: scheduler.AccountState(next_run_at=1790496059, status="scheduled", fail_count=0),
+        2: scheduler.AccountState(next_run_at=None, status="free_skip", fail_count=0),
+        3: scheduler.AccountState(next_run_at=1790469300, status="retry_pending", fail_count=3),
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert "user1(scheduled" in summary
+    assert "user2(free_skip)" in summary
+    assert "user3(retry_pending" in summary
+    assert "실패 3회" in summary
+
+
+def test_format_queue_summary_orders_by_account_id():
+    states = {
+        3: scheduler.AccountState(next_run_at=100, status="scheduled"),
+        1: scheduler.AccountState(next_run_at=100, status="scheduled"),
+        2: scheduler.AccountState(next_run_at=100, status="scheduled"),
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert summary.index("user1") < summary.index("user2") < summary.index("user3")
+
+
+def test_run_scheduler_loop_prints_queue_summary_each_iteration(monkeypatch, tmp_path, capsys):
+    states = {
+        1: scheduler.AccountState(next_run_at=200, status="scheduled"),
+        2: scheduler.AccountState(next_run_at=100, status="scheduled"),
+    }
+
+    call_order = []
+
+    class _StopLoop(Exception):
+        pass
+
+    def fake_run_claude(account_id):
+        call_order.append(account_id)
+        if len(call_order) == 2:
+            raise _StopLoop()
+        return True
+
+    def fake_fetch(config_dir):
+        return {"five_hour_used_percent": 1, "five_hour_reset_at": 99999, "weekly_used_percent": 1, "weekly_reset_at": 99999}
+
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
+    monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 999999)
+
+    now_box = {"t": 100}
+
+    def fake_now():
+        return now_box["t"]
+
+    def fake_sleep(seconds):
+        now_box["t"] += seconds
+
+    with pytest.raises(_StopLoop):
+        scheduler.run_scheduler_loop(
+            states,
+            interval_min=5,
+            threshold=100,
+            fallback_min=305,
+            run_claude_fn=fake_run_claude,
+            sleep_fn=fake_sleep,
+            now_fn=fake_now,
+            queue_path=tmp_path / "queue.json",
+        )
+
+    captured = capsys.readouterr()
+    assert captured.out.count("큐 상태:") >= 2
+    assert "user1(scheduled" in captured.out
+    assert "user2(scheduled" in captured.out
