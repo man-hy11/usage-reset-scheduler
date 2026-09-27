@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import heapq
 import json
 import os
@@ -32,10 +33,15 @@ def state_to_dict(states: dict[int, AccountState]) -> dict:
 
 
 def state_from_dict(raw: dict) -> dict[int, AccountState]:
-    return {
-        int(account_id): AccountState(**fields)
-        for account_id, fields in raw.items()
-    }
+    valid_fields = {f.name for f in dataclasses.fields(AccountState)}
+    result: dict[int, AccountState] = {}
+    for account_id, fields in raw.items():
+        try:
+            filtered = {k: v for k, v in fields.items() if k in valid_fields}
+            result[int(account_id)] = AccountState(**filtered)
+        except (TypeError, ValueError, KeyError):
+            continue
+    return result
 
 
 def load_queue(path: Path) -> dict:
@@ -57,11 +63,26 @@ def initialize_states(
     wait_until: int | None,
     delay_seconds: int,
     now: int,
+    existing_states: dict[int, AccountState] | None = None,
 ) -> dict[int, AccountState]:
+    """Build the starting state map for `account_ids`.
+
+    For any account_id already present in `existing_states` with status
+    "scheduled" or "retry_pending", its saved state is kept as-is (no fresh
+    `check_paid_subscription` call, no schedule reset) so a scheduler restart
+    doesn't lose mid-flight progress. Every other account_id goes through the
+    normal paid-plan gate check.
+    """
+    existing_states = existing_states or {}
     states: dict[int, AccountState] = {}
     start_at = wait_until if wait_until is not None else now + delay_seconds
 
     for account_id in account_ids:
+        saved = existing_states.get(account_id)
+        if saved is not None and saved.status in ("scheduled", "retry_pending"):
+            states[account_id] = saved
+            continue
+
         try:
             accounts.check_paid_subscription(account_id)
         except accounts.AccountStatusError:
@@ -86,9 +107,10 @@ def retry_pending_accounts(
         try:
             config_dir = accounts.account_dir(account_id)
             status = usage.fetch_claude_usage(config_dir)
-        except Exception:
+        except Exception as exc:
             state.fail_count += 1
             state.next_run_at = now + interval_min * 60
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 사용량 조회 실패: {exc!r}")
             if state.fail_count >= FAIL_COUNT_WARN_THRESHOLD:
                 print(f"[account {account_id}] 사용량 조회 {state.fail_count}회 연속 실패, 계속 재시도합니다.")
             continue
@@ -140,12 +162,16 @@ def run_scheduler_loop(
             for aid, state in states.items():
                 if state.status != "free_skip":
                     heapq.heappush(heap, (state.next_run_at, aid))
+            if heap:
+                sleep_fn(max(0, heap[0][0] - now_fn()))
             continue
 
         wait_seconds = max(0, current.next_run_at - now_fn())
         sleep_fn(wait_seconds)
 
-        run_claude_fn(account_id)
+        success = run_claude_fn(account_id)
+        if not success:
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] claude 호출 실패")
 
         run_after = now_fn()
         try:
@@ -155,7 +181,8 @@ def run_scheduler_loop(
             states[account_id] = AccountState(
                 next_run_at=run_after + seconds, status="scheduled", fail_count=0
             )
-        except Exception:
+        except Exception as exc:
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 사용량 조회 실패: {exc!r}")
             states[account_id] = AccountState(
                 next_run_at=run_after + interval_min * 60,
                 status="retry_pending",
@@ -291,6 +318,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[user{account_id}] SKIP: {exc}")
         return 0
 
+    if args.delay < 0 or args.interval < 0:
+        print(f"--delay와 --interval은 음수일 수 없습니다 (delay={args.delay}, interval={args.interval})", file=sys.stderr)
+        return 1
+
     now = int(_time.time())
     wait_until_epoch = None
     if args.wait_until:
@@ -300,7 +331,15 @@ def main(argv: list[str] | None = None) -> int:
             print(str(exc), file=sys.stderr)
             return 1
 
-    states = initialize_states(args.account_ids, wait_until_epoch, args.delay * 60, now)
+    existing_raw = load_queue(QUEUE_PATH)
+    try:
+        existing_states = state_from_dict(existing_raw)
+    except (TypeError, KeyError):
+        existing_states = {}
+
+    states = initialize_states(
+        args.account_ids, wait_until_epoch, args.delay * 60, now, existing_states
+    )
 
     def run_claude_fn(account_id: int) -> bool:
         return run_claude(account_id, args.model, args.effort)

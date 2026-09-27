@@ -484,3 +484,251 @@ def test_parse_wait_until_past_time_raises():
     now_epoch = int(datetime(2026, 9, 27, 23, 0, 0).timestamp())
     with pytest.raises(ValueError, match="이미 과거"):
         scheduler._parse_wait_until("09:00", now_epoch)
+
+
+# --- Fix 1: busy-spin regression ---
+
+
+def test_run_scheduler_loop_sleeps_instead_of_busy_spinning_on_retry_pending(monkeypatch, tmp_path):
+    states = {
+        1: scheduler.AccountState(next_run_at=100, status="retry_pending", fail_count=1),
+    }
+
+    sleep_calls = []
+
+    class _StopLoop(Exception):
+        pass
+
+    def fake_fetch(config_dir):
+        raise RuntimeError("network error")
+
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
+
+    now_box = {"t": 100}
+
+    def fake_now():
+        return now_box["t"]
+
+    iterations = {"n": 0}
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        now_box["t"] += max(seconds, 1)
+        iterations["n"] += 1
+        if iterations["n"] >= 5:
+            raise _StopLoop()
+
+    def fake_run_claude(account_id):
+        raise AssertionError("account stuck in retry_pending should never reach run_claude_fn")
+
+    with pytest.raises(_StopLoop):
+        scheduler.run_scheduler_loop(
+            states,
+            interval_min=5,
+            threshold=100,
+            fallback_min=305,
+            run_claude_fn=fake_run_claude,
+            sleep_fn=fake_sleep,
+            now_fn=fake_now,
+            queue_path=tmp_path / "queue.json",
+        )
+
+    # Loop made bounded progress (stopped after N iterations rather than running forever).
+    assert iterations["n"] == 5
+    # Critical: at least one sleep call must be a real, non-zero duration -
+    # a sleep_fn(0) pattern would still "terminate" this test but leaves the
+    # busy-spin/API-hammering bug unfixed.
+    assert any(s > 0 for s in sleep_calls)
+
+
+# --- Fix 2: silent exception swallowing ---
+
+
+def test_retry_pending_accounts_logs_exception_message(monkeypatch, capsys):
+    states = {
+        1: scheduler.AccountState(next_run_at=100, status="retry_pending", fail_count=0),
+    }
+
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+
+    def fake_fetch(config_dir):
+        raise RuntimeError("some distinctive network failure")
+
+    monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
+
+    scheduler.retry_pending_accounts(states, interval_min=5, threshold=100, fallback_min=305, now=1000)
+
+    captured = capsys.readouterr()
+    assert "some distinctive network failure" in captured.out
+
+
+def test_run_scheduler_loop_logs_exception_after_claude_run(monkeypatch, tmp_path, capsys):
+    states = {
+        1: scheduler.AccountState(next_run_at=100, status="scheduled"),
+    }
+
+    class _StopLoop(Exception):
+        pass
+
+    def fake_run_claude(account_id):
+        return True
+
+    def fake_fetch(config_dir):
+        raise RuntimeError("post-run usage fetch boom")
+
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
+
+    call_count = {"n": 0}
+
+    def fake_now():
+        return 100
+
+    def fake_sleep(seconds):
+        call_count["n"] += 1
+        if call_count["n"] >= 2:
+            raise _StopLoop()
+
+    with pytest.raises(_StopLoop):
+        scheduler.run_scheduler_loop(
+            states,
+            interval_min=5,
+            threshold=100,
+            fallback_min=305,
+            run_claude_fn=fake_run_claude,
+            sleep_fn=fake_sleep,
+            now_fn=fake_now,
+            queue_path=tmp_path / "queue.json",
+        )
+
+    captured = capsys.readouterr()
+    assert "post-run usage fetch boom" in captured.out
+
+
+# --- Fix 3: queue persistence across restarts ---
+
+
+def test_initialize_states_preserves_existing_retry_pending_without_paid_check(monkeypatch):
+    def fail_if_called(account_id):
+        raise AssertionError("check_paid_subscription should not be called for an account already in the saved queue")
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fail_if_called)
+
+    existing_states = {
+        1: scheduler.AccountState(next_run_at=12345, status="retry_pending", fail_count=3),
+    }
+
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, existing_states=existing_states
+    )
+
+    assert states[1].status == "retry_pending"
+    assert states[1].next_run_at == 12345
+    assert states[1].fail_count == 3
+
+
+def test_initialize_states_preserves_existing_scheduled_without_paid_check(monkeypatch):
+    def fail_if_called(account_id):
+        raise AssertionError("check_paid_subscription should not be called for an account already scheduled")
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fail_if_called)
+
+    existing_states = {
+        1: scheduler.AccountState(next_run_at=5000, status="scheduled", fail_count=0),
+    }
+
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, existing_states=existing_states
+    )
+
+    assert states[1].status == "scheduled"
+    assert states[1].next_run_at == 5000
+
+
+def test_initialize_states_gate_checks_account_not_in_existing_states(monkeypatch):
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+
+    states = scheduler.initialize_states(
+        [1], wait_until=None, delay_seconds=0, now=1000, existing_states={}
+    )
+
+    assert states[1].status == "scheduled"
+    assert states[1].next_run_at == 1000
+
+
+def test_main_loads_existing_queue_and_skips_paid_check_for_retry_pending_account(monkeypatch, tmp_path, capsys):
+    queue_path = tmp_path / "queue.json"
+    scheduler.save_queue(
+        queue_path,
+        scheduler.state_to_dict(
+            {1: scheduler.AccountState(next_run_at=999999, status="retry_pending", fail_count=2)}
+        ),
+    )
+    monkeypatch.setattr(scheduler, "QUEUE_PATH", queue_path)
+
+    def fail_if_called(account_id):
+        raise AssertionError("check_paid_subscription should not be called for an account loaded from the queue")
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fail_if_called)
+
+    captured_states = {}
+
+    def fake_run_scheduler_loop(states, **kwargs):
+        captured_states.update(states)
+
+    monkeypatch.setattr(scheduler, "run_scheduler_loop", fake_run_scheduler_loop)
+
+    rc = scheduler.main(["1"])
+
+    assert rc == 0
+    assert captured_states[1].status == "retry_pending"
+    assert captured_states[1].next_run_at == 999999
+    assert captured_states[1].fail_count == 2
+
+
+def test_state_from_dict_ignores_unknown_extra_key():
+    raw = {"1": {"next_run_at": 100, "status": "scheduled", "fail_count": 0, "plan": "pro"}}
+
+    result = scheduler.state_from_dict(raw)
+
+    assert result[1] == scheduler.AccountState(next_run_at=100, status="scheduled", fail_count=0)
+
+
+def test_state_from_dict_omits_entry_missing_required_key():
+    raw = {"1": {"status": "scheduled"}}  # missing next_run_at
+
+    result = scheduler.state_from_dict(raw)
+
+    assert result == {}
+
+
+# --- Fix 4: reject negative --delay/--interval ---
+
+
+def test_main_rejects_negative_delay_without_entering_loop(monkeypatch, capsys):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("negative --delay이지만 스케줄러가 시작됨")
+
+    monkeypatch.setattr(scheduler, "initialize_states", fail_if_called)
+    monkeypatch.setattr(scheduler, "run_scheduler_loop", fail_if_called)
+
+    rc = scheduler.main(["1", "--delay", "-5"])
+
+    captured = capsys.readouterr()
+    assert rc != 0
+    assert captured.err
+
+
+def test_main_rejects_negative_interval_without_entering_loop(monkeypatch, capsys):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("negative --interval이지만 스케줄러가 시작됨")
+
+    monkeypatch.setattr(scheduler, "initialize_states", fail_if_called)
+    monkeypatch.setattr(scheduler, "run_scheduler_loop", fail_if_called)
+
+    rc = scheduler.main(["1", "--interval", "-5"])
+
+    captured = capsys.readouterr()
+    assert rc != 0
+    assert captured.err
