@@ -6,9 +6,11 @@ import dataclasses
 import heapq
 import json
 import os
+import re
 import subprocess
 import sys
 import time as _time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -69,6 +71,11 @@ def _queue_order_key(item: tuple[int, AccountState]) -> tuple[int, int, int]:
     return (0, state.next_run_at, account_id)
 
 
+def _append_last_run_line(lines: list[str], state: AccountState) -> None:
+    if state.last_run_at is not None:
+        lines.append(f"  최근 실행: {_format_when(state.last_run_at)}")
+
+
 def format_queue_summary(states: dict[int, AccountState]) -> str:
     header = "==========큐상태============"
     footer = "=" * len(header)
@@ -85,21 +92,18 @@ def format_queue_summary(states: dict[int, AccountState]) -> str:
 
         if state.status == "free_skip":
             lines.append("  상태: free_skip")
-            if state.last_run_at is not None:
-                lines.append(f"  최근 실행: {_format_when(state.last_run_at)}")
+            _append_last_run_line(lines, state)
             if state.next_run_at is not None:
                 lines.append(f"  다음 구독 확인: {_format_when(state.next_run_at)}")
             continue
 
         if state.status == "retry_pending":
             lines.append(f"  상태: retry_pending (실패 {state.fail_count}회)")
-            if state.last_run_at is not None:
-                lines.append(f"  최근 실행: {_format_when(state.last_run_at)}")
+            _append_last_run_line(lines, state)
             lines.append(f"  다음 재시도: {_format_when(state.next_run_at)}")
         else:
             lines.append(f"  상태: {state.status}")
-            if state.last_run_at is not None:
-                lines.append(f"  최근 실행: {_format_when(state.last_run_at)}")
+            _append_last_run_line(lines, state)
             lines.append(f"  다음 실행: {_format_when(state.next_run_at)}")
 
         if state.five_hour_used_percent is not None and state.five_hour_reset_at is not None:
@@ -183,24 +187,42 @@ def select_paid_account_ids(count: int, get_tool, candidate_ids: list[int]) -> t
 
     `--count`/`-n`용 선택 로직. 각 계정을 실시간으로 `check_paid_subscription`
     확인하므로(캐시된 queue.json 상태는 보지 않음 — `initialize_states`와 동일한
-    이유, docstring 참고) 계정 수만큼 API 호출이 들어갈 수 있다. free 계정은
-    건너뛰고 다음 계정을 확인한다. 후보를 다 훑어도 `count`개를 채우지 못하면
-    찾은 만큼만 반환한다.
+    이유, docstring 참고) 계정 수만큼 API 호출이 들어갈 수 있다.
+
+    한 번에 하나씩 순서대로 확인하면(앞쪽에 free 계정이 몰려 있을 때) 지연이
+    누적되므로, `count`개씩 배치로 묶어 배치 내에서는 동시에 확인한다. 한
+    배치에서 paid 계정이 `count`개를 못 채우면 다음 배치(다음 `count`개
+    후보)로 넘어간다 — "필요한 만큼만 확인하고 멈춘다"는 성격은 배치 단위로
+    유지되므로, 앞쪽에서 다 채워지면 뒤쪽 후보는 아예 확인하지 않는다.
 
     선택된 계정의 plan도 함께 반환해서, 뒤이은 `initialize_states` 호출이
     같은 계정을 또 live-check하지 않도록 한다(`known_plans` 참고).
     """
+    ordered_candidates = sorted(candidate_ids)
     selected: list[int] = []
     plans: dict[int, str] = {}
-    for account_id in sorted(candidate_ids):
+
+    for batch_start in range(0, len(ordered_candidates), count):
         if len(selected) >= count:
             break
-        tool = get_tool(account_id)
-        plan = _check_plan(account_id, tool)
-        if plan is None:
-            continue
-        selected.append(account_id)
-        plans[account_id] = plan
+        batch = ordered_candidates[batch_start:batch_start + count]
+
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            futures = {
+                account_id: executor.submit(_check_plan, account_id, get_tool(account_id))
+                for account_id in batch
+            }
+            batch_plans = {account_id: future.result() for account_id, future in futures.items()}
+
+        for account_id in batch:
+            if len(selected) >= count:
+                break
+            plan = batch_plans[account_id]
+            if plan is None:
+                continue
+            selected.append(account_id)
+            plans[account_id] = plan
+
     return selected, plans
 
 
@@ -400,7 +422,10 @@ def run_scheduler_loop(
         current.plan = plan
 
         # 몇 시에 실행을 *시작*했나가 목적이므로 완료 시각이 아닌 dispatch 시각을 남긴다.
-        current.last_run_at = checked_at
+        # 로컬 변수로 직접 들고 있는다 — states[account_id]는 run_claude_fn 실행 중
+        # 다른 경로(다중 스레드/향후 병렬화 등)로 갱신될 수 있어, 굳이 객체에
+        # 썼다가 되읽는 것보다 값을 그대로 들고 있는 편이 더 안전하다.
+        last_run_at = checked_at
         success = run_claude_fn(account_id)
         if not success:
             print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] claude 호출 실패")
@@ -409,7 +434,6 @@ def run_scheduler_loop(
         tool = states[account_id].tool
         email = states[account_id].email
         plan = states[account_id].plan
-        last_run_at = current.last_run_at
         try:
             status = fetch_usage(account_id, tool)
             seconds = usage.compute_next_run(status, threshold, fallback_min, run_after)
@@ -525,11 +549,18 @@ def log_dir_for_account(account_id: int, tool: str = "claude") -> Path:
     return log_dir
 
 
+_RUN_LOG_NAME_RE = re.compile(r"^loop-\d{8}-\d{6}\.log$")
+
+
 def last_logged_run_at(account_id: int, tool: str = "claude") -> int | None:
     """가장 최근 실행 로그의 시각. 실행 기록이 없으면 None.
 
     로그 파일명에 실행 시각이 들어 있으므로 mtime 대신 파일명을 본다. 로그를
     백업했다가 되돌리면 mtime은 복사 시각으로 덮어써지기 때문이다.
+
+    `loop-YYYYMMDD-HHMMSS.log` 형식은(정규식으로 그 형식만 남긴 뒤에는) 사전순
+    정렬이 곧 시간순 정렬이므로, 로그가 아무리 쌓여도(로테이션 없음) 파일명마다
+    datetime.strptime을 돌릴 필요 없이 가장 큰 이름 하나만 골라 그것만 파싱한다.
     """
     log_dir = accounts.account_dir(account_id, tool) / "start-limit-runs"
     try:
@@ -537,16 +568,13 @@ def last_logged_run_at(account_id: int, tool: str = "claude") -> int | None:
     except OSError:
         return None
 
-    stamps = []
-    for name in names:
-        if not (name.startswith("loop-") and name.endswith(".log")):
-            continue
-        try:
-            parsed = datetime.strptime(name[5:-4], "%Y%m%d-%H%M%S")
-        except ValueError:
-            continue
-        stamps.append(int(parsed.timestamp()))
-    return max(stamps) if stamps else None
+    candidates = [name for name in names if _RUN_LOG_NAME_RE.match(name)]
+    if not candidates:
+        return None
+
+    latest_name = max(candidates)
+    parsed = datetime.strptime(latest_name[5:-4], "%Y%m%d-%H%M%S")
+    return int(parsed.timestamp())
 
 
 def _extract_claude_text(stdout: str) -> str:

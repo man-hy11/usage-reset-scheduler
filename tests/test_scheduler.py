@@ -644,6 +644,55 @@ def test_select_paid_account_ids_returns_fewer_than_count_when_exhausted(monkeyp
     assert plans == {1: "pro", 3: "pro", 4: "pro", 6: "pro"}
 
 
+def test_select_paid_account_ids_checks_within_a_batch_concurrently(monkeypatch):
+    # 배치(count개) 안에서는 순차가 아니라 동시에 확인해야, 앞쪽에 느린/free
+    # 계정이 몰려 있어도 지연이 배치 하나 분량으로 그친다.
+    import threading
+    import time
+
+    lock = threading.Lock()
+    peak = {"n": 0, "cur": 0}
+
+    def fake_check_paid_subscription(account_id, tool):
+        with lock:
+            peak["cur"] += 1
+            peak["n"] = max(peak["n"], peak["cur"])
+        time.sleep(0.05)
+        with lock:
+            peak["cur"] -= 1
+        return "pro"
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check_paid_subscription)
+
+    start = time.time()
+    selected, _ = scheduler.select_paid_account_ids(3, lambda _account_id: "claude", [1, 2, 3])
+    elapsed = time.time() - start
+
+    assert selected == [1, 2, 3]
+    assert peak["n"] == 3
+    assert elapsed < 0.12  # 순차였다면 ~0.15s, 동시라면 ~0.05s
+
+
+def test_select_paid_account_ids_does_not_check_next_batch_once_filled(monkeypatch):
+    # 첫 배치가 부족해 다음 배치로 넘어가더라도, count가 채워진 뒤의 배치는
+    # 아예 확인하지 않아야 한다 (불필요한 API 호출 방지).
+    checked = []
+    free_ids = {1, 2}
+
+    def fake_check_paid_subscription(account_id, tool):
+        checked.append(account_id)
+        if account_id in free_ids:
+            raise accounts.AccountStatusError("유료 구독이 아님 (subscriptionType=free)")
+        return "pro"
+
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check_paid_subscription)
+
+    selected, _ = scheduler.select_paid_account_ids(2, lambda _account_id: "claude", [1, 2, 3, 4, 5, 6])
+
+    assert selected == [3, 4]
+    assert sorted(checked) == [1, 2, 3, 4]  # 5, 6은 확인하지 않았어야 한다
+
+
 def test_build_claude_command_shape():
     cmd = scheduler.build_claude_command("claude-haiku-4-5", "low", "Reply with OK.")
     assert cmd == [
@@ -1652,6 +1701,48 @@ def test_last_logged_run_at_ignores_unrelated_and_malformed_filenames(monkeypatc
     assert scheduler.last_logged_run_at(1, "claude") == expected
 
 
+def test_last_logged_run_at_malformed_name_does_not_win_string_sort(monkeypatch, tmp_path):
+    # "loop-not-a-timestamp.log"는 알파벳(n)이 숫자보다 사전순으로 커서, 정상
+    # 타임스탬프 파일명들보다 문자열 정렬상 뒤에 온다 — max()로 최신 파일을
+    # 고르기 전에 형식이 안 맞는 이름은 반드시 걸러내야 한다.
+    log_dir = tmp_path / "start-limit-runs"
+    log_dir.mkdir(parents=True)
+    (log_dir / "loop-20260101-000000.log").write_text("x")
+    (log_dir / "loop-not-a-timestamp.log").write_text("x")
+
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path)
+
+    expected = int(datetime.strptime("20260101-000000", "%Y%m%d-%H%M%S").timestamp())
+
+    assert scheduler.last_logged_run_at(1, "claude") == expected
+
+
+def test_last_logged_run_at_parses_timestamp_at_most_once(monkeypatch, tmp_path):
+    # 로그가 아무리 쌓여도 최신 파일명 하나만 파싱해야 한다 (전수 스캔 방지).
+    log_dir = tmp_path / "start-limit-runs"
+    log_dir.mkdir(parents=True)
+    for stamp in ["20260101-000000", "20260501-120000", "20260927-235959"]:
+        (log_dir / f"loop-{stamp}.log").write_text("x")
+
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path)
+
+    call_count = {"n": 0}
+    real_strptime = datetime.strptime
+
+    class _CountingDatetime(datetime):
+        @classmethod
+        def strptime(cls, *args, **kwargs):
+            call_count["n"] += 1
+            return real_strptime(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "datetime", _CountingDatetime)
+
+    expected = int(real_strptime("20260927-235959", "%Y%m%d-%H%M%S").timestamp())
+
+    assert scheduler.last_logged_run_at(1, "claude") == expected
+    assert call_count["n"] == 1
+
+
 def test_initialize_states_recovers_last_run_at_from_run_log(monkeypatch, tmp_path):
     # 재시작할 때마다 상태를 처음부터 다시 계산하므로, 직전 실행 시각이
     # 사라지지 않으려면 실행 로그에서 복원해야 한다.
@@ -1692,10 +1783,16 @@ def test_run_scheduler_loop_records_dispatch_time_not_completion_time(monkeypatc
 
     def fake_run_claude(account_id):
         now_box["t"] += 60  # 실행에 60초가 걸린 상황
-        raise _StopLoop()
+        return True  # run_claude_fn이 정상 반환돼야 states 재구성 코드까지 도달한다
+
+    sleep_calls = {"n": 0}
 
     def fake_sleep(seconds):
         now_box["t"] += seconds
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 2:
+            # states[1]이 재구성된 뒤(다음 루프 진입 직전)에 멈춘다.
+            raise _StopLoop()
 
     with pytest.raises(_StopLoop):
         scheduler.run_scheduler_loop(
@@ -1709,8 +1806,6 @@ def test_run_scheduler_loop_records_dispatch_time_not_completion_time(monkeypatc
             queue_path=tmp_path / "queue.json",
         )
 
-    # 시계는 이미 160으로 넘어갔지만 기록된 값은 실행을 시작한 100이어야 한다.
-    assert now_box["t"] == 160
     assert states[1].last_run_at == 100
 
 
