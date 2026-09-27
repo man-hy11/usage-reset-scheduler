@@ -7,7 +7,7 @@ from pathlib import Path
 
 import requests
 
-MAX_SLEEP_SECONDS = 691_200  # 8일, collect-usage.sh의 MAX와 동일
+MAX_SLEEP_SECONDS = 691_200  # 8일
 
 
 def read_claude_token(config_dir: Path) -> str:

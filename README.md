@@ -1,4 +1,4 @@
-# start_limit
+# usage-reset-scheduler
 
 Claude Code(`claude` CLI)와 Codex CLI(`codex`)를 여러 계정에 걸쳐 최소 호출로 반복 실행해, 사용량 창(5시간 / 주간)을 리셋 직후 다시 시작시키는 스케줄러입니다. 도구가 섞여 있어도(Claude 계정 + Codex 계정) **하나의 우선순위 큐**로 관리합니다.
 
