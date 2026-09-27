@@ -120,3 +120,40 @@ def test_fetch_claude_usage_normalizes_response(tmp_path, monkeypatch):
 def test_read_claude_token_missing_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         usage.read_claude_token(tmp_path / "does-not-exist")
+
+
+def test_fetch_codex_usage_normalizes_response(tmp_path, monkeypatch):
+    config_dir = tmp_path / ".codex"
+    config_dir.mkdir()
+    (config_dir / "auth.json").write_text(
+        _json.dumps({"tokens": {"access_token": "tok-456"}})
+    )
+
+    captured = {}
+
+    def fake_get(url, headers=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        return _FakeResponse(
+            {
+                "rate_limit": {
+                    "primary_window": {"used_percent": 12, "reset_at": "2026-09-27T12:00:00+09:00"},
+                    "secondary_window": {"used_percent": 34, "reset_at": "2026-10-03T11:00:00+09:00"},
+                }
+            }
+        )
+
+    monkeypatch.setattr(usage.requests, "get", fake_get)
+
+    result = usage.fetch_codex_usage(config_dir)
+
+    assert result["tool"] == "codex"
+    assert result["five_hour_used_percent"] == 12
+    assert result["weekly_used_percent"] == 34
+    assert captured["headers"]["Authorization"] == "Bearer tok-456"
+    assert "chatgpt.com" in captured["url"]
+
+
+def test_read_codex_token_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        usage.read_codex_token(tmp_path / "does-not-exist")

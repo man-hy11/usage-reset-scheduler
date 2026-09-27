@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 import accounts
+import registry
 import scheduler
 import usage
 
@@ -71,7 +72,7 @@ def test_load_queue_returns_empty_dict_when_file_corrupted(tmp_path):
     assert scheduler.load_queue(path) == {}
 
 
-def _stub_usage_fetch(monkeypatch, email=None, **overrides):
+def _stub_usage_fetch(monkeypatch, email=None, plan="pro", **overrides):
     result = {
         "five_hour_used_percent": None,
         "five_hour_reset_at": None,
@@ -79,19 +80,20 @@ def _stub_usage_fetch(monkeypatch, email=None, **overrides):
         "weekly_reset_at": None,
     }
     result.update(overrides)
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
     monkeypatch.setattr(usage, "fetch_claude_usage", lambda config_dir: result)
-    monkeypatch.setattr(accounts, "account_email", lambda account_id: email)
+    monkeypatch.setattr(accounts, "account_email", lambda account_id, tool="claude": email)
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": plan)
 
 
 def test_initialize_states_marks_free_account_as_free_skip(monkeypatch):
-    def fake_check(account_id):
+    def fake_check(account_id, tool="claude"):
         if account_id == 2:
             raise accounts.AccountStatusError("유료 Claude 구독이 아님")
         return "pro"
 
-    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
     _stub_usage_fetch(monkeypatch)
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
 
     states = scheduler.initialize_states([1, 2], wait_until=None, delay_seconds=0, now=1000)
 
@@ -101,7 +103,7 @@ def test_initialize_states_marks_free_account_as_free_skip(monkeypatch):
 
 
 def test_initialize_states_uses_wait_until_when_given(monkeypatch):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
     _stub_usage_fetch(monkeypatch)
 
     states = scheduler.initialize_states([1], wait_until=5000, delay_seconds=0, now=1000)
@@ -110,7 +112,7 @@ def test_initialize_states_uses_wait_until_when_given(monkeypatch):
 
 
 def test_initialize_states_uses_now_plus_delay_when_no_wait_until(monkeypatch):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
     _stub_usage_fetch(monkeypatch)
 
     states = scheduler.initialize_states([1], wait_until=None, delay_seconds=120, now=1000)
@@ -119,7 +121,7 @@ def test_initialize_states_uses_now_plus_delay_when_no_wait_until(monkeypatch):
 
 
 def test_initialize_states_fetches_usage_for_newly_scheduled_account(monkeypatch):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
     _stub_usage_fetch(
         monkeypatch,
         five_hour_used_percent=42,
@@ -137,7 +139,7 @@ def test_initialize_states_fetches_usage_for_newly_scheduled_account(monkeypatch
 
 
 def test_initialize_states_does_not_fetch_usage_for_free_skip_account(monkeypatch):
-    def fake_check(account_id):
+    def fake_check(account_id, tool="claude"):
         raise accounts.AccountStatusError("유료 Claude 구독이 아님")
 
     monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
@@ -145,7 +147,7 @@ def test_initialize_states_does_not_fetch_usage_for_free_skip_account(monkeypatc
     def fail_if_called(config_dir):
         raise AssertionError("fetch_claude_usage should not be called for a free_skip account")
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
     monkeypatch.setattr(usage, "fetch_claude_usage", fail_if_called)
 
     states = scheduler.initialize_states([2], wait_until=None, delay_seconds=0, now=1000)
@@ -154,8 +156,9 @@ def test_initialize_states_does_not_fetch_usage_for_free_skip_account(monkeypatc
 
 
 def test_initialize_states_leaves_usage_fields_none_when_fetch_fails(monkeypatch):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_email", lambda account_id, tool="claude": None)
 
     def fake_fetch(config_dir):
         raise RuntimeError("network down")
@@ -174,7 +177,7 @@ def test_retry_pending_accounts_promotes_on_success(monkeypatch):
         1: scheduler.AccountState(next_run_at=100, status="retry_pending", fail_count=2),
     }
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
     monkeypatch.setattr(usage, "fetch_claude_usage", lambda config_dir: {"weekly_used_percent": 10, "weekly_reset_at": 9999, "five_hour_used_percent": 5, "five_hour_reset_at": 2000})
     monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 500)
 
@@ -194,7 +197,7 @@ def test_retry_pending_accounts_keeps_retrying_on_failure(monkeypatch):
         1: scheduler.AccountState(next_run_at=100, status="retry_pending", fail_count=2),
     }
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
 
     def fake_fetch(config_dir):
         raise RuntimeError("network error")
@@ -213,7 +216,7 @@ def test_retry_pending_accounts_keeps_retrying_past_five_failures(monkeypatch):
         1: scheduler.AccountState(next_run_at=100, status="retry_pending", fail_count=5),
     }
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
 
     def fake_fetch(config_dir):
         raise RuntimeError("network error")
@@ -275,7 +278,7 @@ def test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order(monkeypat
     def fake_fetch(config_dir):
         return {"five_hour_used_percent": 1, "five_hour_reset_at": 99999, "weekly_used_percent": 1, "weekly_reset_at": 99999}
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
     monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
     monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 999999)
 
@@ -323,7 +326,7 @@ def test_run_scheduler_loop_stores_usage_limits_after_successful_run(monkeypatch
             "weekly_reset_at": 1791073800,
         }
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
     monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
     monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 999999)
 
@@ -363,8 +366,10 @@ def test_run_scheduler_loop_stores_usage_limits_after_successful_run(monkeypatch
 def test_parse_args_defaults_to_account_1_when_none_given():
     args = scheduler.parse_args([])
     assert args.account_ids == [1]
-    assert args.model == "claude-haiku-4-5"
-    assert args.effort == "low"
+    # --model/--effort는 지정하지 않으면 None으로 남고, 계정별 도구(claude/codex)의
+    # 기본값이 main()에서 실행 시점에 적용된다 (DEFAULT_MODEL/DEFAULT_EFFORT 참고).
+    assert args.model is None
+    assert args.effort is None
     assert args.interval == 5
     assert args.threshold == 100
     assert args.delay == 0
@@ -425,7 +430,7 @@ def test_build_claude_command_shape():
 
 
 def test_run_claude_extracts_text_deltas_and_returns_true_on_success(monkeypatch, tmp_path):
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: tmp_path / f"acct{account_id}")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path / f"acct{account_id}")
 
     stream_lines = [
         _json.dumps({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "OK"}}}),
@@ -445,7 +450,7 @@ def test_run_claude_extracts_text_deltas_and_returns_true_on_success(monkeypatch
 
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id: log_dir)
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id, tool="claude": log_dir)
 
     result = scheduler.run_claude(1, "claude-haiku-4-5", "low")
 
@@ -456,7 +461,7 @@ def test_run_claude_extracts_text_deltas_and_returns_true_on_success(monkeypatch
 
 
 def test_run_claude_returns_false_on_nonzero_exit(monkeypatch, tmp_path):
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: tmp_path / f"acct{account_id}")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path / f"acct{account_id}")
 
     class _FakeCompletedProcess:
         def __init__(self):
@@ -468,7 +473,7 @@ def test_run_claude_returns_false_on_nonzero_exit(monkeypatch, tmp_path):
 
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id: log_dir)
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id, tool="claude": log_dir)
 
     result = scheduler.run_claude(1, "claude-haiku-4-5", "low")
 
@@ -476,7 +481,7 @@ def test_run_claude_returns_false_on_nonzero_exit(monkeypatch, tmp_path):
 
 
 def test_run_claude_skips_non_dict_json_line_and_still_extracts_valid_text_deltas(monkeypatch, tmp_path):
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: tmp_path / f"acct{account_id}")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path / f"acct{account_id}")
 
     stream_lines = [
         _json.dumps({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "OK"}}}),
@@ -493,7 +498,7 @@ def test_run_claude_skips_non_dict_json_line_and_still_extracts_valid_text_delta
 
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id: log_dir)
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id, tool="claude": log_dir)
 
     result = scheduler.run_claude(1, "claude-haiku-4-5", "low")
 
@@ -504,7 +509,7 @@ def test_run_claude_skips_non_dict_json_line_and_still_extracts_valid_text_delta
 
 
 def test_run_claude_skips_non_dict_event_field_and_still_extracts_valid_text_deltas(monkeypatch, tmp_path):
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: tmp_path / f"acct{account_id}")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": tmp_path / f"acct{account_id}")
 
     stream_lines = [
         _json.dumps({"type": "stream_event", "event": {"delta": {"type": "text_delta", "text": "OK"}}}),
@@ -521,7 +526,7 @@ def test_run_claude_skips_non_dict_event_field_and_still_extracts_valid_text_del
 
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id: log_dir)
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id, tool="claude": log_dir)
 
     result = scheduler.run_claude(1, "claude-haiku-4-5", "low")
 
@@ -532,9 +537,9 @@ def test_run_claude_skips_non_dict_event_field_and_still_extracts_valid_text_del
 
 
 def test_main_check_subscription_prints_plan_and_returns_zero(monkeypatch, capsys):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
-    monkeypatch.setattr(accounts, "account_email", lambda account_id: None)
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_email", lambda account_id, tool="claude": None)
     monkeypatch.setattr(
         usage,
         "fetch_claude_usage",
@@ -554,9 +559,9 @@ def test_main_check_subscription_prints_plan_and_returns_zero(monkeypatch, capsy
 
 
 def test_main_check_subscription_includes_email_when_known(monkeypatch, capsys):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
-    monkeypatch.setattr(accounts, "account_email", lambda account_id: "a@example.com")
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_email", lambda account_id, tool="claude": "a@example.com")
     monkeypatch.setattr(
         usage,
         "fetch_claude_usage",
@@ -576,7 +581,7 @@ def test_main_check_subscription_includes_email_when_known(monkeypatch, capsys):
 
 
 def test_main_check_subscription_reports_skip_for_free_plan(monkeypatch, capsys):
-    def fake_check(account_id):
+    def fake_check(account_id, tool="claude"):
         raise accounts.AccountStatusError("유료 Claude 구독이 아님 (subscriptionType=free)")
 
     monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
@@ -589,9 +594,9 @@ def test_main_check_subscription_reports_skip_for_free_plan(monkeypatch, capsys)
 
 
 def test_main_check_subscription_includes_usage_limits(monkeypatch, capsys):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
-    monkeypatch.setattr(accounts, "account_email", lambda account_id: None)
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_email", lambda account_id, tool="claude": None)
     monkeypatch.setattr(
         usage,
         "fetch_claude_usage",
@@ -616,9 +621,9 @@ def test_main_check_subscription_includes_usage_limits(monkeypatch, capsys):
 
 
 def test_main_check_subscription_reports_usage_fetch_failure_without_crashing(monkeypatch, capsys):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
-    monkeypatch.setattr(accounts, "account_email", lambda account_id: None)
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_email", lambda account_id, tool="claude": None)
 
     def fake_fetch(config_dir):
         raise RuntimeError("network down")
@@ -636,7 +641,7 @@ def test_main_list_accounts_routes_to_accounts_module(monkeypatch, capsys, tmp_p
     monkeypatch.setattr(
         accounts,
         "list_accounts",
-        lambda: [(1, "pro", tmp_path / ".claude", "a@example.com")],
+        lambda get_tool=None: [(1, "pro", tmp_path / ".claude", "a@example.com", "claude")],
     )
 
     rc = scheduler.main(["--list-accounts"])
@@ -646,13 +651,14 @@ def test_main_list_accounts_routes_to_accounts_module(monkeypatch, capsys, tmp_p
     assert "user1" in captured.out
     assert "pro" in captured.out
     assert "a@example.com" in captured.out
+    assert "claude" in captured.out
 
 
 def test_main_list_accounts_shows_dash_when_email_unknown(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(
         accounts,
         "list_accounts",
-        lambda: [(2, "SKIP: free", tmp_path / ".claude-account-2", None)],
+        lambda get_tool=None: [(2, "SKIP: free", tmp_path / ".claude-account-2", None, "claude")],
     )
 
     rc = scheduler.main(["--list-accounts"])
@@ -667,19 +673,39 @@ def test_main_list_accounts_shows_dash_when_email_unknown(monkeypatch, capsys, t
 def test_main_add_account_routes_to_accounts_module(monkeypatch):
     called = {}
 
-    def fake_add(account_id):
+    def fake_add(account_id, tool="claude"):
         called["account_id"] = account_id
+        called["tool"] = tool
 
     monkeypatch.setattr(accounts, "add_account", fake_add)
+    monkeypatch.setattr(scheduler, "prompt_for_tool", lambda: "claude")
+    monkeypatch.setattr(registry, "set_tool", lambda path, account_id, tool: None)
 
     rc = scheduler.main(["--add-account", "5"])
 
     assert rc == 0
     assert called["account_id"] == 5
+    assert called["tool"] == "claude"
+
+
+def test_main_add_account_prompts_for_tool_and_registers_codex(monkeypatch):
+    called = {}
+
+    monkeypatch.setattr(accounts, "add_account", lambda account_id, tool="claude": called.update(account_id=account_id, tool=tool))
+    monkeypatch.setattr(scheduler, "prompt_for_tool", lambda: "codex")
+
+    registered = {}
+    monkeypatch.setattr(registry, "set_tool", lambda path, account_id, tool: registered.update(account_id=account_id, tool=tool))
+
+    rc = scheduler.main(["--add-account", "4"])
+
+    assert rc == 0
+    assert called["tool"] == "codex"
+    assert registered == {"account_id": 4, "tool": "codex"}
 
 
 def test_main_remove_account_routes_to_accounts_module(monkeypatch, capsys):
-    monkeypatch.setattr(accounts, "remove_account", lambda account_id: Path("/fake/backup"))
+    monkeypatch.setattr(accounts, "remove_account", lambda account_id, tool="claude": Path("/fake/backup"))
 
     rc = scheduler.main(["--remove-account", "2"])
 
@@ -689,7 +715,7 @@ def test_main_remove_account_routes_to_accounts_module(monkeypatch, capsys):
 
 
 def test_main_remove_account_1_returns_nonzero(monkeypatch, capsys):
-    def fake_remove(account_id):
+    def fake_remove(account_id, tool="claude"):
         raise ValueError("user1은 제거할 수 없습니다")
 
     monkeypatch.setattr(accounts, "remove_account", fake_remove)
@@ -702,7 +728,7 @@ def test_main_remove_account_1_returns_nonzero(monkeypatch, capsys):
 
 
 def test_main_rejects_past_wait_until_without_entering_loop(monkeypatch, capsys):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError("과거 --wait-until인데 스케줄러 루프가 시작됨")
@@ -765,7 +791,7 @@ def test_run_scheduler_loop_sleeps_instead_of_busy_spinning_on_retry_pending(mon
     def fake_fetch(config_dir):
         raise RuntimeError("network error")
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
     monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
 
     now_box = {"t": 100}
@@ -813,7 +839,7 @@ def test_retry_pending_accounts_logs_exception_message(monkeypatch, capsys):
         1: scheduler.AccountState(next_run_at=100, status="retry_pending", fail_count=0),
     }
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
 
     def fake_fetch(config_dir):
         raise RuntimeError("some distinctive network failure")
@@ -840,7 +866,7 @@ def test_run_scheduler_loop_logs_exception_after_claude_run(monkeypatch, tmp_pat
     def fake_fetch(config_dir):
         raise RuntimeError("post-run usage fetch boom")
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
     monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
 
     call_count = {"n": 0}
@@ -912,7 +938,7 @@ def test_initialize_states_preserves_existing_scheduled_without_paid_check(monke
 
 
 def test_initialize_states_refreshes_usage_for_account_restored_from_saved_queue(monkeypatch):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
     _stub_usage_fetch(
         monkeypatch,
         five_hour_used_percent=42,
@@ -948,7 +974,7 @@ def test_initialize_states_refreshes_usage_for_account_restored_from_saved_queue
 
 
 def test_initialize_states_gate_checks_account_not_in_existing_states(monkeypatch):
-    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
     _stub_usage_fetch(monkeypatch)
 
     states = scheduler.initialize_states(
@@ -991,7 +1017,14 @@ def test_main_loads_existing_queue_and_skips_paid_check_for_retry_pending_accoun
 
 
 def test_state_from_dict_ignores_unknown_extra_key():
-    raw = {"1": {"next_run_at": 100, "status": "scheduled", "fail_count": 0, "plan": "pro"}}
+    raw = {
+        "1": {
+            "next_run_at": 100,
+            "status": "scheduled",
+            "fail_count": 0,
+            "totally_unknown_field": "should be dropped",
+        }
+    }
 
     result = scheduler.state_from_dict(raw)
 
@@ -1162,7 +1195,7 @@ def test_run_scheduler_loop_prints_queue_summary_each_iteration(monkeypatch, tmp
     def fake_fetch(config_dir):
         return {"five_hour_used_percent": 1, "five_hour_reset_at": 99999, "weekly_used_percent": 1, "weekly_reset_at": 99999}
 
-    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id, tool="claude": Path(f"/fake/{account_id}"))
     monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
     monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 999999)
 

@@ -14,9 +14,11 @@ from datetime import datetime
 from pathlib import Path
 
 import accounts
+import registry
 import usage
 
 QUEUE_PATH = Path(__file__).parent / ".schedule" / "queue.json"
+REGISTRY_PATH = Path(__file__).parent / ".schedule" / "accounts.json"
 
 FAIL_COUNT_WARN_THRESHOLD = 5
 
@@ -31,6 +33,8 @@ class AccountState:
     weekly_used_percent: float | None = None
     weekly_reset_at: int | None = None
     email: str | None = None
+    plan: str | None = None  # 예: "pro", "max", "plus" — check_paid_subscription 결과
+    tool: str = "claude"  # "claude" | "codex"
 
 
 def state_to_dict(states: dict[int, AccountState]) -> dict:
@@ -60,10 +64,11 @@ def format_queue_summary(states: dict[int, AccountState]) -> str:
 
     for index, account_id in enumerate(sorted(states), start=1):
         state = states[account_id]
-        lines.append(f"{index}. user{account_id}")
+        lines.append(f"{index}. user{account_id} [{state.tool}]")
 
         if state.email:
-            lines.append(f"  계정: {state.email}")
+            plan_suffix = f"({state.plan})" if state.plan else ""
+            lines.append(f"  계정: {state.email}{plan_suffix}")
 
         if state.status == "free_skip":
             lines.append("  상태: free_skip")
@@ -103,16 +108,23 @@ def save_queue(path: Path, raw: dict) -> None:
         json.dump(raw, f, ensure_ascii=False, indent=2)
 
 
-def _fetch_usage_fields(account_id: int) -> dict:
-    """Fetch current usage-limit fields and login email for account_id.
+def fetch_usage(account_id: int, tool: str) -> dict:
+    """Dispatch to the usage-fetch function matching `tool`."""
+    config_dir = accounts.account_dir(account_id, tool)
+    if tool == "codex":
+        return usage.fetch_codex_usage(config_dir)
+    return usage.fetch_claude_usage(config_dir)
+
+
+def _fetch_usage_fields(account_id: int, tool: str = "claude") -> dict:
+    """Fetch current usage-limit fields, login email and plan for account_id.
 
     Never raises — this is informational display data only and must not
     block startup or flip a gated account's schedule/status. The usage
-    lookup and the email lookup fail independently of each other.
+    lookup and the email/plan lookup fail independently of each other.
     """
     try:
-        config_dir = accounts.account_dir(account_id)
-        status = usage.fetch_claude_usage(config_dir)
+        status = fetch_usage(account_id, tool)
         usage_fields = {
             "five_hour_used_percent": status.get("five_hour_used_percent"),
             "five_hour_reset_at": status.get("five_hour_reset_at"),
@@ -128,7 +140,11 @@ def _fetch_usage_fields(account_id: int) -> dict:
             "weekly_reset_at": None,
         }
 
-    usage_fields["email"] = accounts.account_email(account_id)
+    usage_fields["email"] = accounts.account_email(account_id, tool)
+    try:
+        usage_fields["plan"] = accounts.check_paid_subscription(account_id, tool)
+    except accounts.AccountStatusError:
+        usage_fields["plan"] = None
     return usage_fields
 
 
@@ -138,6 +154,7 @@ def initialize_states(
     delay_seconds: int,
     now: int,
     existing_states: dict[int, AccountState] | None = None,
+    get_tool=None,
 ) -> dict[int, AccountState]:
     """Build the starting state map for `account_ids`.
 
@@ -151,25 +168,36 @@ def initialize_states(
     account gets a fresh usage-limit lookup at startup (even if it already
     carried usage fields from a saved queue) so the very first queue-status
     print reflects current data instead of a possibly stale snapshot.
+
+    get_tool: optional callable(account_id) -> "claude"|"codex" (normally
+    `functools.partial(registry.get_tool, REGISTRY_PATH)`). Defaults to
+    always "claude" when omitted.
     """
+    if get_tool is None:
+        get_tool = lambda _account_id: "claude"
+
     existing_states = existing_states or {}
     states: dict[int, AccountState] = {}
     start_at = wait_until if wait_until is not None else now + delay_seconds
 
     for account_id in account_ids:
+        tool = get_tool(account_id)
         saved = existing_states.get(account_id)
         if saved is not None and saved.status in ("scheduled", "retry_pending"):
-            state = dataclasses.replace(saved, **_fetch_usage_fields(account_id))
+            state = dataclasses.replace(saved, tool=tool, **_fetch_usage_fields(account_id, tool))
             states[account_id] = state
             continue
 
         try:
-            accounts.check_paid_subscription(account_id)
+            accounts.check_paid_subscription(account_id, tool)
         except accounts.AccountStatusError:
-            states[account_id] = AccountState(next_run_at=None, status="free_skip")
+            states[account_id] = AccountState(next_run_at=None, status="free_skip", tool=tool)
             continue
         states[account_id] = AccountState(
-            next_run_at=start_at, status="scheduled", **_fetch_usage_fields(account_id)
+            next_run_at=start_at,
+            status="scheduled",
+            tool=tool,
+            **_fetch_usage_fields(account_id, tool),
         )
 
     return states
@@ -187,8 +215,7 @@ def retry_pending_accounts(
             continue
 
         try:
-            config_dir = accounts.account_dir(account_id)
-            status = usage.fetch_claude_usage(config_dir)
+            status = fetch_usage(account_id, state.tool)
         except Exception as exc:
             state.fail_count += 1
             state.next_run_at = now + interval_min * 60
@@ -261,10 +288,11 @@ def run_scheduler_loop(
             print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] claude 호출 실패")
 
         run_after = now_fn()
+        tool = states[account_id].tool
         email = states[account_id].email
+        plan = states[account_id].plan
         try:
-            config_dir = accounts.account_dir(account_id)
-            status = usage.fetch_claude_usage(config_dir)
+            status = fetch_usage(account_id, tool)
             seconds = usage.compute_next_run(status, threshold, fallback_min, run_after)
             states[account_id] = AccountState(
                 next_run_at=run_after + seconds,
@@ -275,6 +303,8 @@ def run_scheduler_loop(
                 weekly_used_percent=status.get("weekly_used_percent"),
                 weekly_reset_at=status.get("weekly_reset_at"),
                 email=email,
+                plan=plan,
+                tool=tool,
             )
         except Exception as exc:
             print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 사용량 조회 실패: {exc!r}")
@@ -283,6 +313,8 @@ def run_scheduler_loop(
                 status="retry_pending",
                 fail_count=1,
                 email=email,
+                plan=plan,
+                tool=tool,
             )
 
         save_queue(queue_path, state_to_dict(states))
@@ -292,11 +324,15 @@ def run_scheduler_loop(
                 heapq.heappush(heap, (state.next_run_at, aid))
 
 
+DEFAULT_MODEL = {"claude": "claude-haiku-4-5", "codex": "gpt-6-luna"}
+DEFAULT_EFFORT = {"claude": "low", "codex": "low"}
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("account_ids", nargs="*", type=int, default=None)
-    parser.add_argument("--model", default="claude-haiku-4-5")
-    parser.add_argument("--effort", default="low")
+    parser.add_argument("--model", default=None, help="지정하지 않으면 계정별 도구(claude/codex)의 기본 모델을 사용합니다.")
+    parser.add_argument("--effort", default=None, help="지정하지 않으면 계정별 도구(claude/codex)의 기본 effort를 사용합니다.")
     parser.add_argument("-w", "--wait-until", dest="wait_until", default=None)
     parser.add_argument("-d", "--delay", type=int, default=0)
     parser.add_argument("--interval", type=int, default=5)
@@ -335,25 +371,27 @@ def build_claude_command(model: str, effort: str, prompt: str) -> list[str]:
     ]
 
 
-def log_dir_for_account(account_id: int) -> Path:
-    config_dir = accounts.account_dir(account_id)
+def build_codex_command(model: str, effort: str, prompt: str) -> list[str]:
+    return [
+        "codex", "exec",
+        "--json",
+        "--sandbox", "danger-full-access",
+        "--model", model,
+        "-c", f"model_reasoning_effort={effort}",
+        prompt,
+    ]
+
+
+def log_dir_for_account(account_id: int, tool: str = "claude") -> Path:
+    config_dir = accounts.account_dir(account_id, tool)
     log_dir = config_dir / "start-limit-runs"
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 
 
-def run_claude(account_id: int, model: str, effort: str) -> bool:
-    env = os.environ.copy()
-    if account_id == 1:
-        env.pop("CLAUDE_CONFIG_DIR", None)
-    else:
-        env["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(account_id))
-
-    cmd = build_claude_command(model, effort, PROMPT_TEXT)
-    completed = subprocess.run(cmd, env=env, capture_output=True, text=True)
-
+def _extract_claude_text(stdout: str) -> str:
     text_parts = []
-    for line in completed.stdout.splitlines():
+    for line in stdout.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -368,16 +406,84 @@ def run_claude(account_id: int, model: str, effort: str) -> bool:
             continue
         if delta.get("type") == "text_delta":
             text_parts.append(delta.get("text", ""))
+    return "".join(text_parts)
 
-    output_text = "".join(text_parts)
 
-    log_dir = log_dir_for_account(account_id)
+def _extract_codex_text(stdout: str) -> str:
+    text_parts = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            text_parts.append(text)
+    return "".join(text_parts)
+
+
+def _run_and_log(account_id: int, tool: str, cmd: list[str], env: dict, extract_text) -> bool:
+    completed = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    output_text = extract_text(completed.stdout)
+
+    log_dir = log_dir_for_account(account_id, tool)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     log_file = log_dir / f"loop-{timestamp}.log"
     log_file.write_text(output_text)
 
     print(output_text)
     return completed.returncode == 0
+
+
+def run_claude(account_id: int, model: str, effort: str) -> bool:
+    env = os.environ.copy()
+    if account_id == 1:
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(account_id))
+
+    cmd = build_claude_command(model, effort, PROMPT_TEXT)
+    return _run_and_log(account_id, "claude", cmd, env, _extract_claude_text)
+
+
+def run_codex(account_id: int, model: str, effort: str) -> bool:
+    env = os.environ.copy()
+    if account_id == 1:
+        env.pop("CODEX_HOME", None)
+    else:
+        env["CODEX_HOME"] = str(accounts.account_dir(account_id, "codex"))
+
+    cmd = build_codex_command(model, effort, PROMPT_TEXT)
+    return _run_and_log(account_id, "codex", cmd, env, _extract_codex_text)
+
+
+def run_tool(account_id: int, tool: str, model: str, effort: str) -> bool:
+    if tool == "codex":
+        return run_codex(account_id, model, effort)
+    return run_claude(account_id, model, effort)
+
+
+def prompt_for_tool(input_fn=input) -> str:
+    """Interactively ask which tool a newly-registered account uses.
+
+    Enter (empty input) or "1" selects claude; "2" selects codex. Any other
+    input re-prompts.
+    """
+    print("사용할 도구를 선택하세요:")
+    print("1. claude (기본값)")
+    print("2. codex")
+    while True:
+        choice = input_fn("입력 (Enter=1): ").strip()
+        if choice in ("", "1"):
+            return "claude"
+        if choice == "2":
+            return "codex"
+        print(f"알 수 없는 입력입니다: {choice!r} (1 또는 2를 입력하세요)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -387,19 +493,24 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     args = parse_args(argv)
 
+    def get_tool(account_id: int) -> str:
+        return registry.get_tool(REGISTRY_PATH, account_id)
+
     if args.add_account is not None:
-        accounts.add_account(args.add_account)
+        tool = prompt_for_tool()
+        registry.set_tool(REGISTRY_PATH, args.add_account, tool)
+        accounts.add_account(args.add_account, tool)
         return 0
 
     if args.list_accounts:
-        for account_id, status_text, path, email in accounts.list_accounts():
+        for account_id, status_text, path, email, tool in accounts.list_accounts(get_tool):
             email_text = email or "-"
-            print(f"user{account_id:<4} {status_text:<12} {email_text:<28} {path}")
+            print(f"user{account_id:<4} [{tool:<6}] {status_text:<12} {email_text:<28} {path}")
         return 0
 
     if args.remove_account is not None:
         try:
-            backup = accounts.remove_account(args.remove_account)
+            backup = accounts.remove_account(args.remove_account, get_tool(args.remove_account))
         except (ValueError, FileNotFoundError) as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -408,18 +519,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check_subscription:
         for account_id in args.account_ids:
+            tool = get_tool(account_id)
             try:
-                plan = accounts.check_paid_subscription(account_id)
-                email = accounts.account_email(account_id)
-                email_suffix = f" ({email})" if email else ""
-                print(f"[user{account_id}] 유료 구독 확인: {plan}{email_suffix}")
+                plan = accounts.check_paid_subscription(account_id, tool)
+                email = accounts.account_email(account_id, tool)
+                account_text = f"{email}({plan})" if email else plan
+                print(f"[user{account_id}] [{tool}] 유료 구독 확인: {account_text}")
             except accounts.AccountStatusError as exc:
-                print(f"[user{account_id}] SKIP: {exc}")
+                print(f"[user{account_id}] [{tool}] SKIP: {exc}")
                 continue
 
             try:
-                config_dir = accounts.account_dir(account_id)
-                status = usage.fetch_claude_usage(config_dir)
+                status = fetch_usage(account_id, tool)
             except Exception as exc:
                 print(f"[user{account_id}]   사용량 조회 실패: {exc!r}")
                 continue
@@ -455,11 +566,14 @@ def main(argv: list[str] | None = None) -> int:
         existing_states = {}
 
     states = initialize_states(
-        args.account_ids, wait_until_epoch, args.delay * 60, now, existing_states
+        args.account_ids, wait_until_epoch, args.delay * 60, now, existing_states, get_tool
     )
 
     def run_claude_fn(account_id: int) -> bool:
-        return run_claude(account_id, args.model, args.effort)
+        tool = states[account_id].tool
+        model = args.model or DEFAULT_MODEL[tool]
+        effort = args.effort or DEFAULT_EFFORT[tool]
+        return run_tool(account_id, tool, model, effort)
 
     run_scheduler_loop(
         states,

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,16 @@ def test_account_dir_for_account_1_is_dot_claude(monkeypatch, tmp_path):
 def test_account_dir_for_account_n_uses_suffix(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     assert accounts.account_dir(3) == tmp_path / ".claude-account-3"
+
+
+def test_account_dir_for_codex_account_1_is_dot_codex(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert accounts.account_dir(1, tool="codex") == tmp_path / ".codex"
+
+
+def test_account_dir_for_codex_account_n_uses_suffix(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert accounts.account_dir(4, tool="codex") == tmp_path / ".codex-account-4"
 
 
 @pytest.mark.parametrize("plan", ["pro", "max", "team", "enterprise"])
@@ -36,6 +47,18 @@ def test_classify_subscription_rejects_logged_out():
 
 def test_classify_subscription_rejects_api_key_auth():
     status = {"loggedIn": True, "authMethod": "apiKey", "subscriptionType": "pro"}
+    with pytest.raises(accounts.AccountStatusError):
+        accounts.classify_subscription(status)
+
+
+@pytest.mark.parametrize("plan", ["plus", "pro", "team", "business", "enterprise"])
+def test_classify_subscription_accepts_codex_paid_plans(plan):
+    status = {"loggedIn": True, "authMethod": "chatgpt", "subscriptionType": plan}
+    assert accounts.classify_subscription(status) == plan
+
+
+def test_classify_subscription_rejects_codex_free_plan():
+    status = {"loggedIn": True, "authMethod": "chatgpt", "subscriptionType": "free"}
     with pytest.raises(accounts.AccountStatusError):
         accounts.classify_subscription(status)
 
@@ -105,6 +128,80 @@ def test_run_claude_auth_status_raises_on_nonzero_exit(monkeypatch, tmp_path):
 
     with pytest.raises(accounts.AccountStatusError):
         accounts.run_claude_auth_status(1)
+
+
+def _make_jwt(claims: dict) -> str:
+    import base64
+    import json as _j
+
+    def _b64(obj):
+        return base64.urlsafe_b64encode(_j.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{_b64({'alg': 'none'})}.{_b64(claims)}.sig"
+
+
+def _write_codex_auth(config_dir: Path, claims: dict) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    id_token = _make_jwt(claims)
+    (config_dir / "auth.json").write_text(
+        json.dumps({"tokens": {"id_token": id_token, "access_token": "at-1"}})
+    )
+
+
+def test_run_claude_auth_status_codex_decodes_id_token(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _write_codex_auth(
+        tmp_path / ".codex-account-4",
+        {
+            "email": "a@example.com",
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+        },
+    )
+
+    status = accounts.run_claude_auth_status(4, tool="codex")
+
+    assert status["loggedIn"] is True
+    assert status["authMethod"] == "chatgpt"
+    assert status["subscriptionType"] == "plus"
+    assert status["email"] == "a@example.com"
+
+
+def test_run_claude_auth_status_codex_raises_when_auth_file_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    with pytest.raises(accounts.AccountStatusError):
+        accounts.run_claude_auth_status(4, tool="codex")
+
+
+def test_run_claude_auth_status_codex_reports_logged_out_when_no_id_token(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    config_dir = tmp_path / ".codex"
+    config_dir.mkdir()
+    (config_dir / "auth.json").write_text(json.dumps({"tokens": {}}))
+
+    status = accounts.run_claude_auth_status(1, tool="codex")
+
+    assert status["loggedIn"] is False
+
+
+def test_check_paid_subscription_codex_returns_plan(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _write_codex_auth(
+        tmp_path / ".codex",
+        {"email": "a@example.com", "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}},
+    )
+
+    assert accounts.check_paid_subscription(1, tool="codex") == "pro"
+
+
+def test_account_email_codex_returns_email(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _write_codex_auth(
+        tmp_path / ".codex",
+        {"email": "a@example.com", "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"}},
+    )
+
+    assert accounts.account_email(1, tool="codex") == "a@example.com"
 
 
 def test_check_paid_subscription_returns_plan_for_paid_account(monkeypatch, tmp_path):
@@ -189,6 +286,25 @@ def test_add_account_creates_dir_and_runs_login(monkeypatch, tmp_path):
     assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".claude-account-2")
 
 
+def test_add_account_codex_creates_dir_and_runs_codex_login(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    captured = {}
+
+    def fake_run(cmd, env, check):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return _FakeCompleted("", 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(accounts, "subprocess", subprocess)
+
+    accounts.add_account(4, tool="codex")
+
+    assert (tmp_path / ".codex-account-4").is_dir()
+    assert captured["cmd"] == ["codex", "login"]
+    assert captured["env"]["CODEX_HOME"] == str(tmp_path / ".codex-account-4")
+
+
 def test_remove_account_moves_to_backup_path(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     target = tmp_path / ".claude-account-2"
@@ -240,3 +356,33 @@ def test_list_accounts_reports_status_for_each(monkeypatch, tmp_path):
     assert result_by_id[2][1].startswith("SKIP:")
     assert result_by_id[1][3] == "a@example.com"
     assert result_by_id[2][3] is None
+    assert result_by_id[1][4] == "claude"
+
+
+def test_list_accounts_discovers_codex_dirs_and_uses_get_tool(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (tmp_path / ".claude").mkdir()
+    _write_codex_auth(
+        tmp_path / ".codex-account-4",
+        {"email": "b@example.com", "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"}},
+    )
+
+    def fake_run(cmd, capture_output, text, env, check):
+        return _FakeCompleted(
+            '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "pro", "email": "a@example.com"}'
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(accounts, "subprocess", subprocess)
+
+    def get_tool(account_id):
+        return "codex" if account_id == 4 else "claude"
+
+    result = accounts.list_accounts(get_tool=get_tool)
+    result_by_id = {r[0]: r for r in result}
+
+    assert result_by_id[1][4] == "claude"
+    assert result_by_id[4][4] == "codex"
+    assert result_by_id[4][1] == "plus"
+    assert result_by_id[4][3] == "b@example.com"
+    assert result_by_id[4][2] == tmp_path / ".codex-account-4"

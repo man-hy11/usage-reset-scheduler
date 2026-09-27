@@ -17,6 +17,13 @@ def read_claude_token(config_dir: Path) -> str:
     return credentials["claudeAiOauth"]["accessToken"]
 
 
+def read_codex_token(config_dir: Path) -> str:
+    auth_path = config_dir / "auth.json"
+    with open(auth_path) as f:
+        auth = json.load(f)
+    return auth["tokens"]["access_token"]
+
+
 def fetch_claude_usage(config_dir: Path) -> dict:
     token = read_claude_token(config_dir)
     response = requests.get(
@@ -40,6 +47,30 @@ def fetch_claude_usage(config_dir: Path) -> dict:
         "five_hour_reset_at": _to_epoch(five.get("resets_at")),
         "weekly_used_percent": week.get("utilization"),
         "weekly_reset_at": _to_epoch(week.get("resets_at")),
+    }
+
+
+def fetch_codex_usage(config_dir: Path) -> dict:
+    token = read_codex_token(config_dir)
+    response = requests.get(
+        "https://chatgpt.com/backend-api/wham/usage",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    raw = response.json()
+
+    rate_limit = raw.get("rate_limit") or {}
+    primary = rate_limit.get("primary_window") or {}
+    secondary = rate_limit.get("secondary_window") or {}
+
+    return {
+        "tool": "codex",
+        "fetched_at": int(time.time()),
+        "five_hour_used_percent": primary.get("used_percent"),
+        "five_hour_reset_at": _to_epoch(primary.get("reset_at")),
+        "weekly_used_percent": secondary.get("used_percent"),
+        "weekly_reset_at": _to_epoch(secondary.get("reset_at")),
     }
 
 
