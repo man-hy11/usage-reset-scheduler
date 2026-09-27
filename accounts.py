@@ -229,6 +229,29 @@ def add_account(account_id: int, tool: str = "claude") -> None:
     env = os.environ.copy()
     env["CLAUDE_CONFIG_DIR"] = str(path)
     subprocess.run(["claude", "auth", "login"], env=env, check=True)
+    mark_onboarding_complete(path)
+
+
+def mark_onboarding_complete(config_dir: Path) -> None:
+    """Set hasCompletedOnboarding in config_dir/.claude.json.
+
+    `claude auth login` only stores credentials; without this flag an
+    interactive `claude` run with CLAUDE_CONFIG_DIR=config_dir shows the
+    first-run onboarding (theme / "Select login method") even though the
+    account is already authenticated. Other keys are preserved.
+    """
+    config_path = config_dir / ".claude.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except FileNotFoundError:
+        config = {}
+    if config.get("hasCompletedOnboarding") is True:
+        return
+    config["hasCompletedOnboarding"] = True
+    tmp_path = config_path.with_name(config_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(config, indent=2))
+    os.chmod(tmp_path, 0o600)
+    tmp_path.replace(config_path)
 
 
 def remove_account(account_id: int, tool: str = "claude") -> Path:

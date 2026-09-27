@@ -300,6 +300,18 @@ def test_add_account_creates_dir_and_runs_login(monkeypatch, tmp_path):
     assert expected_dir.is_dir()
     assert captured["cmd"] == ["claude", "auth", "login"]
     assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(expected_dir)
+    assert json.loads((expected_dir / ".claude.json").read_text())["hasCompletedOnboarding"] is True
+
+
+def test_mark_onboarding_complete_preserves_existing_keys(tmp_path):
+    (tmp_path / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "a@example.com"}}))
+
+    accounts.mark_onboarding_complete(tmp_path)
+
+    config = json.loads((tmp_path / ".claude.json").read_text())
+    assert config["hasCompletedOnboarding"] is True
+    assert config["oauthAccount"] == {"emailAddress": "a@example.com"}
+    assert (tmp_path / ".claude.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_add_account_codex_creates_dir_and_runs_codex_login(monkeypatch, tmp_path):
