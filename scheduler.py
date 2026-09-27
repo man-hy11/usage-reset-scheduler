@@ -178,24 +178,30 @@ def _check_plan(account_id: int, tool: str) -> str | None:
         return None
 
 
-def select_paid_account_ids(count: int, get_tool, registered_ids: list[int]) -> list[int]:
-    """`registered_ids`를 오름차순으로 훑으며, 유료 구독인 계정만 최대 `count`개 고른다.
+def select_paid_account_ids(count: int, get_tool, candidate_ids: list[int]) -> tuple[list[int], dict[int, str]]:
+    """`candidate_ids`를 오름차순으로 훑으며, 유료 구독인 계정만 최대 `count`개 고른다.
 
     `--count`/`-n`용 선택 로직. 각 계정을 실시간으로 `check_paid_subscription`
     확인하므로(캐시된 queue.json 상태는 보지 않음 — `initialize_states`와 동일한
     이유, docstring 참고) 계정 수만큼 API 호출이 들어갈 수 있다. free 계정은
-    건너뛰고 다음 계정을 확인한다. 등록된 계정을 다 훑어도 `count`개를 채우지
-    못하면 찾은 만큼만 반환한다.
+    건너뛰고 다음 계정을 확인한다. 후보를 다 훑어도 `count`개를 채우지 못하면
+    찾은 만큼만 반환한다.
+
+    선택된 계정의 plan도 함께 반환해서, 뒤이은 `initialize_states` 호출이
+    같은 계정을 또 live-check하지 않도록 한다(`known_plans` 참고).
     """
     selected: list[int] = []
-    for account_id in sorted(registered_ids):
+    plans: dict[int, str] = {}
+    for account_id in sorted(candidate_ids):
         if len(selected) >= count:
             break
         tool = get_tool(account_id)
-        if _check_plan(account_id, tool) is None:
+        plan = _check_plan(account_id, tool)
+        if plan is None:
             continue
         selected.append(account_id)
-    return selected
+        plans[account_id] = plan
+    return selected, plans
 
 
 def initialize_states(
@@ -207,6 +213,7 @@ def initialize_states(
     fallback_min: int,
     get_tool=None,
     plan_recheck_seconds: int = PLAN_RECHECK_MIN * 60,
+    known_plans: dict[int, str] | None = None,
 ) -> dict[int, AccountState]:
     """Build the starting state map for `account_ids` from scratch.
 
@@ -235,16 +242,23 @@ def initialize_states(
     get_tool: optional callable(account_id) -> "claude"|"codex" (normally
     `functools.partial(registry.get_tool, REGISTRY_PATH)`). Defaults to
     always "claude" when omitted.
+
+    known_plans: optional {account_id: plan} for accounts whose paid-plan
+    status was already live-checked moments ago (e.g. by
+    `select_paid_account_ids`), to skip a redundant `_check_plan` call.
+    Accounts not present in this dict are still checked normally.
     """
     if get_tool is None:
         get_tool = lambda _account_id: "claude"
+    if known_plans is None:
+        known_plans = {}
 
     states: dict[int, AccountState] = {}
 
     for account_id in account_ids:
         tool = get_tool(account_id)
         last_run_at = last_logged_run_at(account_id, tool)
-        plan = _check_plan(account_id, tool)
+        plan = known_plans[account_id] if account_id in known_plans else _check_plan(account_id, tool)
         if plan is None:
             states[account_id] = AccountState(
                 next_run_at=now + plan_recheck_seconds,
@@ -648,16 +662,31 @@ def main(argv: list[str] | None = None) -> int:
     def get_tool(account_id: int) -> str:
         return registry.get_tool(REGISTRY_PATH, account_id)
 
+    management_flags = (
+        args.add_account is not None
+        or args.list_accounts
+        or args.remove_account is not None
+        or args.check_subscription
+    )
+    if args.count is not None and management_flags:
+        print(
+            "--count/-n은 --add-account/--list-accounts/--remove-account/"
+            "--check-subscription과 함께 쓸 수 없습니다.",
+            file=sys.stderr,
+        )
+        return 1
+
+    known_plans: dict[int, str] = {}
     if args.count is not None:
-        registered_ids = list(registry.load_registry(REGISTRY_PATH).keys())
-        args.account_ids = select_paid_account_ids(args.count, get_tool, registered_ids)
+        candidate_ids = list(accounts.known_account_ids())
+        args.account_ids, known_plans = select_paid_account_ids(args.count, get_tool, candidate_ids)
         if not args.account_ids:
-            print("--count/-n: 유료 구독인 등록된 계정이 없습니다.", file=sys.stderr)
+            print("--count/-n: 유료 구독인 계정이 없습니다.", file=sys.stderr)
             return 1
         if len(args.account_ids) < args.count:
             print(
                 f"--count/-n: 유료 구독 계정 {len(args.account_ids)}개만 찾았습니다 "
-                f"(요청 {args.count}개, 등록된 계정 {len(registered_ids)}개): "
+                f"(요청 {args.count}개, 전체 계정 {len(candidate_ids)}개): "
                 + ", ".join(f"user{i}" for i in args.account_ids)
             )
 
@@ -734,6 +763,7 @@ def main(argv: list[str] | None = None) -> int:
         threshold=args.threshold,
         fallback_min=args.interval,
         get_tool=get_tool,
+        known_plans=known_plans,
     )
 
     def run_claude_fn(account_id: int) -> bool:

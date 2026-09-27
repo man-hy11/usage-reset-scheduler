@@ -376,6 +376,23 @@ def remove_account(account_id: int, tool: str = "claude") -> Path:
     return backup
 
 
+def known_account_ids() -> set[int]:
+    """모든 계정 ID(도구 무관). account 1은 --add-account 없이도 항상 유효하므로
+    포함하고, 나머지는 실제 계정 디렉터리(claude-N/codex-N)가 존재하는지로 찾는다
+    — `.schedule/accounts.json`에 등록됐는지와 무관하게, 실제로 쓸 수 있는 계정
+    전부를 대상으로 해야 하는 곳(예: --count)에서 쓴다.
+    """
+    accounts_root = Path.home() / ".usage-reset-scheduler" / "accounts"
+    account_ids = {1}
+    for candidate in accounts_root.glob("*-*"):
+        if not candidate.is_dir():
+            continue
+        suffix = candidate.name.rsplit("-", 1)[-1]
+        if suffix.isdigit() and int(suffix) >= 1:
+            account_ids.add(int(suffix))
+    return account_ids
+
+
 def list_accounts(get_tool=None) -> list[tuple[int, str, Path, str | None, str]]:
     """List every known account across both tools.
 
@@ -386,17 +403,8 @@ def list_accounts(get_tool=None) -> list[tuple[int, str, Path, str | None, str]]
     if get_tool is None:
         get_tool = lambda _account_id: "claude"
 
-    accounts_root = Path.home() / ".usage-reset-scheduler" / "accounts"
-    account_ids = {1}
-    for candidate in accounts_root.glob("*-*"):
-        if not candidate.is_dir():
-            continue
-        suffix = candidate.name.rsplit("-", 1)[-1]
-        if suffix.isdigit() and int(suffix) >= 1:
-            account_ids.add(int(suffix))
-
     results = []
-    for account_id in sorted(account_ids):
+    for account_id in sorted(known_account_ids()):
         tool = get_tool(account_id)
         path = account_dir(account_id, tool)
         try:

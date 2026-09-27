@@ -113,6 +113,34 @@ def test_initialize_states_marks_free_account_as_free_skip(monkeypatch):
     assert states[1].status == "scheduled"
 
 
+def test_initialize_states_skips_check_plan_for_known_plans(monkeypatch):
+    # select_paid_account_ids가 이미 확인한 plan은 initialize_states가 다시
+    # 실시간 조회하지 않아야 한다 (중복 네트워크 호출 방지).
+    calls = []
+
+    def fake_check(account_id, tool="claude"):
+        calls.append(account_id)
+        return "pro"
+
+    _stub_usage_fetch(monkeypatch)
+    monkeypatch.setattr(accounts, "check_paid_subscription", fake_check)
+
+    states = scheduler.initialize_states(
+        [1, 2],
+        wait_until=None,
+        delay_seconds=0,
+        now=1000,
+        threshold=100,
+        fallback_min=5,
+        known_plans={1: "pro"},
+    )
+
+    assert calls == [2]  # account 1은 known_plans에 있으므로 재확인하지 않는다
+    assert states[1].status == "scheduled"
+    assert states[1].plan == "pro"
+    assert states[2].status == "scheduled"
+
+
 def test_initialize_states_uses_wait_until_when_given(monkeypatch):
     monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
     _stub_usage_fetch(monkeypatch)
@@ -550,6 +578,42 @@ def test_parse_args_count_rejects_non_positive():
         scheduler.parse_args(["--count", "-1"])
 
 
+def test_main_rejects_count_combined_with_management_flags(monkeypatch, capsys):
+    for flag, value in [
+        ("--add-account", "5"),
+        ("--list-accounts", None),
+        ("--remove-account", "2"),
+        ("--check-subscription", None),
+    ]:
+        argv = ["--count", "3", flag] + ([value] if value is not None else [])
+        rc = scheduler.main(argv)
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "--count/-n" in captured.err
+
+
+def test_main_count_includes_account_1_even_when_unregistered(monkeypatch):
+    # account 1 is valid without ever running --add-account 1, so --count
+    # must consider it even if it has no entry in the registry.
+    monkeypatch.setattr(registry, "load_registry", lambda path: {})
+    monkeypatch.setattr(accounts, "known_account_ids", lambda: {1})
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    _stub_usage_fetch(monkeypatch)
+
+    captured_account_ids = {}
+
+    def fake_run_scheduler_loop(states, **kwargs):
+        captured_account_ids["ids"] = sorted(states.keys())
+        raise _StopLoop()
+
+    monkeypatch.setattr(scheduler, "run_scheduler_loop", fake_run_scheduler_loop)
+
+    with pytest.raises(_StopLoop):
+        scheduler.main(["--count", "1"])
+
+    assert captured_account_ids["ids"] == [1]
+
+
 def test_select_paid_account_ids_skips_free_and_stops_at_count(monkeypatch):
     free_ids = {2, 5}
 
@@ -560,8 +624,9 @@ def test_select_paid_account_ids_skips_free_and_stops_at_count(monkeypatch):
 
     monkeypatch.setattr(accounts, "check_paid_subscription", fake_check_paid_subscription)
 
-    selected = scheduler.select_paid_account_ids(3, lambda _account_id: "claude", [1, 2, 3, 4, 5, 6])
+    selected, plans = scheduler.select_paid_account_ids(3, lambda _account_id: "claude", [1, 2, 3, 4, 5, 6])
     assert selected == [1, 3, 4]
+    assert plans == {1: "pro", 3: "pro", 4: "pro"}
 
 
 def test_select_paid_account_ids_returns_fewer_than_count_when_exhausted(monkeypatch):
@@ -574,8 +639,9 @@ def test_select_paid_account_ids_returns_fewer_than_count_when_exhausted(monkeyp
 
     monkeypatch.setattr(accounts, "check_paid_subscription", fake_check_paid_subscription)
 
-    selected = scheduler.select_paid_account_ids(10, lambda _account_id: "claude", [1, 2, 3, 4, 5, 6])
+    selected, plans = scheduler.select_paid_account_ids(10, lambda _account_id: "claude", [1, 2, 3, 4, 5, 6])
     assert selected == [1, 3, 4, 6]
+    assert plans == {1: "pro", 3: "pro", 4: "pro", 6: "pro"}
 
 
 def test_build_claude_command_shape():
