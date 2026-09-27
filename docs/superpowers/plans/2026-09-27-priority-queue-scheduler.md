@@ -1154,10 +1154,10 @@ Expected: PASS (12 passed) — 이 테스트는 `run_scheduler_loop`가 사용�
 
 - [ ] **Step 11: `run_scheduler_loop` 순차 실행 테스트 작성**
 
-`tests/test_scheduler.py`에 추가:
+`tests/test_scheduler.py`에 추가. 루프를 끝내려면 `run_claude_fn`이 예외를 던지는 방식을 쓴다 — `run_claude_fn`은 실제로는 `bool`만 반환하고 `states`를 직접 건드리지 않으므로(아래 Step 14 구현이 `run_claude_fn` 반환 직후 무조건 `states[account_id]`를 새로 계산해 덮어쓴다), 테스트 안에서 `states`를 직접 조작해 종료시키는 방식은 그 덮어쓰기에 의해 무효화되어 무한 루프가 된다:
 
 ```python
-def test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order(monkeypatch):
+def test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order(monkeypatch, tmp_path):
     states = {
         1: scheduler.AccountState(next_run_at=200, status="scheduled"),
         2: scheduler.AccountState(next_run_at=100, status="scheduled"),
@@ -1166,14 +1166,15 @@ def test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order(monkeypat
     call_order = []
     sleep_calls = []
 
+    class _StopLoop(Exception):
+        pass
+
     def fake_run_claude(account_id):
         call_order.append(account_id)
-        # 두 번째 호출(account 1) 후에는 모두 free_skip으로 만들어 루프를 끝낸다.
+        # 두 번째 호출 후 예외로 루프를 끝낸다 (states 직접 조작은 Step 14의
+        # 무조건 덮어쓰기 로직에 의해 무효화되므로 쓰지 않는다).
         if len(call_order) == 2:
-            states[1].status = "free_skip"
-            states[1].next_run_at = None
-            states[2].status = "free_skip"
-            states[2].next_run_at = None
+            raise _StopLoop()
         return True
 
     def fake_fetch(config_dir):
@@ -1192,16 +1193,17 @@ def test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order(monkeypat
         sleep_calls.append(seconds)
         now_box["t"] += seconds
 
-    scheduler.run_scheduler_loop(
-        states,
-        interval_min=5,
-        threshold=100,
-        fallback_min=305,
-        run_claude_fn=fake_run_claude,
-        sleep_fn=fake_sleep,
-        now_fn=fake_now,
-        queue_path=Path("/tmp/does-not-matter-because-mocked.json"),
-    )
+    with pytest.raises(_StopLoop):
+        scheduler.run_scheduler_loop(
+            states,
+            interval_min=5,
+            threshold=100,
+            fallback_min=305,
+            run_claude_fn=fake_run_claude,
+            sleep_fn=fake_sleep,
+            now_fn=fake_now,
+            queue_path=tmp_path / "queue.json",
+        )
 
     assert call_order == [2, 1]
     assert sleep_calls == [0, 100]  # account2: 100-100=0 대기, account1: 200-100=100 대기
@@ -1212,9 +1214,7 @@ def test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order(monkeypat
 Run: `cd ~/start_limit && python3 -m pytest tests/test_scheduler.py -v`
 Expected: FAIL — `AttributeError: module 'scheduler' has no attribute 'run_scheduler_loop'`
 
-- [ ] **Step 13: `save_queue` 호출을 테스트에서 무해하게 만들기 위해 `queue_path`를 실제 파일 쓰기 가능한 임시 경로로 교체 확인**
-
-Step 11의 테스트가 실제로 `/tmp`에 쓰기 때문에, 대신 `tmp_path` fixture를 쓰도록 테스트를 수정한다. `tests/test_scheduler.py`의 `test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order` 시그니처를 `def test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order(monkeypatch, tmp_path):`로 바꾸고 마지막 `queue_path=Path("/tmp/does-not-matter-because-mocked.json")`를 `queue_path=tmp_path / "queue.json"`으로 교체한다.
+- [ ] **Step 13: (통합됨 — Step 11에서 이미 `tmp_path`를 사용하므로 별도 조치 불필요)**
 
 - [ ] **Step 14: `run_scheduler_loop` 구현**
 
