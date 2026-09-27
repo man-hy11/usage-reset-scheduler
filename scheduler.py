@@ -30,6 +30,7 @@ class AccountState:
     five_hour_reset_at: int | None = None
     weekly_used_percent: float | None = None
     weekly_reset_at: int | None = None
+    email: str | None = None
 
 
 def state_to_dict(states: dict[int, AccountState]) -> dict:
@@ -53,30 +54,39 @@ def _format_when(epoch: int) -> str:
 
 
 def format_queue_summary(states: dict[int, AccountState]) -> str:
-    parts = []
-    for account_id in sorted(states):
+    header = "==========큐상태============"
+    footer = "=" * len(header)
+    lines = [header]
+
+    for index, account_id in enumerate(sorted(states), start=1):
         state = states[account_id]
+        lines.append(f"{index}. user{account_id}")
+
+        if state.email:
+            lines.append(f"  계정: {state.email}")
+
         if state.status == "free_skip":
-            parts.append(f"user{account_id}(free_skip)")
+            lines.append("  상태: free_skip")
             continue
 
-        when = _format_when(state.next_run_at)
         if state.status == "retry_pending":
-            entry = f"user{account_id}(retry_pending, 다음 {when}, 실패 {state.fail_count}회"
+            lines.append(f"  상태: retry_pending (실패 {state.fail_count}회)")
+            lines.append(f"  다음 재시도: {_format_when(state.next_run_at)}")
         else:
-            entry = f"user{account_id}({state.status}, 다음 {when}"
+            lines.append(f"  상태: {state.status}")
+            lines.append(f"  다음 실행: {_format_when(state.next_run_at)}")
 
         if state.five_hour_used_percent is not None and state.five_hour_reset_at is not None:
-            entry += (
-                f", 5시간 {state.five_hour_used_percent:g}% 리셋 {_format_when(state.five_hour_reset_at)}"
+            lines.append(
+                f"  5시간 한도: {state.five_hour_used_percent:g}% (리셋 {_format_when(state.five_hour_reset_at)})"
             )
         if state.weekly_used_percent is not None and state.weekly_reset_at is not None:
-            entry += (
-                f", 주간 {state.weekly_used_percent:g}% 리셋 {_format_when(state.weekly_reset_at)}"
+            lines.append(
+                f"  주간 한도: {state.weekly_used_percent:g}% (리셋 {_format_when(state.weekly_reset_at)})"
             )
 
-        parts.append(entry + ")")
-    return "큐 상태: " + " ".join(parts)
+    lines.append(footer)
+    return "\n".join(lines)
 
 
 def load_queue(path: Path) -> dict:
@@ -93,6 +103,35 @@ def save_queue(path: Path, raw: dict) -> None:
         json.dump(raw, f, ensure_ascii=False, indent=2)
 
 
+def _fetch_usage_fields(account_id: int) -> dict:
+    """Fetch current usage-limit fields and login email for account_id.
+
+    Never raises — this is informational display data only and must not
+    block startup or flip a gated account's schedule/status. The usage
+    lookup and the email lookup fail independently of each other.
+    """
+    try:
+        config_dir = accounts.account_dir(account_id)
+        status = usage.fetch_claude_usage(config_dir)
+        usage_fields = {
+            "five_hour_used_percent": status.get("five_hour_used_percent"),
+            "five_hour_reset_at": status.get("five_hour_reset_at"),
+            "weekly_used_percent": status.get("weekly_used_percent"),
+            "weekly_reset_at": status.get("weekly_reset_at"),
+        }
+    except Exception as exc:
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 초기 사용량 조회 실패: {exc!r}")
+        usage_fields = {
+            "five_hour_used_percent": None,
+            "five_hour_reset_at": None,
+            "weekly_used_percent": None,
+            "weekly_reset_at": None,
+        }
+
+    usage_fields["email"] = accounts.account_email(account_id)
+    return usage_fields
+
+
 def initialize_states(
     account_ids: list[int],
     wait_until: int | None,
@@ -103,10 +142,15 @@ def initialize_states(
     """Build the starting state map for `account_ids`.
 
     For any account_id already present in `existing_states` with status
-    "scheduled" or "retry_pending", its saved state is kept as-is (no fresh
-    `check_paid_subscription` call, no schedule reset) so a scheduler restart
-    doesn't lose mid-flight progress. Every other account_id goes through the
-    normal paid-plan gate check.
+    "scheduled" or "retry_pending", its saved next_run_at/status/fail_count
+    are kept as-is (no fresh `check_paid_subscription` call, no schedule
+    reset) so a scheduler restart doesn't lose mid-flight progress. Every
+    other account_id goes through the normal paid-plan gate check.
+
+    Regardless of which path an account took above, every non-free_skip
+    account gets a fresh usage-limit lookup at startup (even if it already
+    carried usage fields from a saved queue) so the very first queue-status
+    print reflects current data instead of a possibly stale snapshot.
     """
     existing_states = existing_states or {}
     states: dict[int, AccountState] = {}
@@ -115,7 +159,8 @@ def initialize_states(
     for account_id in account_ids:
         saved = existing_states.get(account_id)
         if saved is not None and saved.status in ("scheduled", "retry_pending"):
-            states[account_id] = saved
+            state = dataclasses.replace(saved, **_fetch_usage_fields(account_id))
+            states[account_id] = state
             continue
 
         try:
@@ -123,7 +168,9 @@ def initialize_states(
         except accounts.AccountStatusError:
             states[account_id] = AccountState(next_run_at=None, status="free_skip")
             continue
-        states[account_id] = AccountState(next_run_at=start_at, status="scheduled")
+        states[account_id] = AccountState(
+            next_run_at=start_at, status="scheduled", **_fetch_usage_fields(account_id)
+        )
 
     return states
 
@@ -214,6 +261,7 @@ def run_scheduler_loop(
             print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] claude 호출 실패")
 
         run_after = now_fn()
+        email = states[account_id].email
         try:
             config_dir = accounts.account_dir(account_id)
             status = usage.fetch_claude_usage(config_dir)
@@ -226,6 +274,7 @@ def run_scheduler_loop(
                 five_hour_reset_at=status.get("five_hour_reset_at"),
                 weekly_used_percent=status.get("weekly_used_percent"),
                 weekly_reset_at=status.get("weekly_reset_at"),
+                email=email,
             )
         except Exception as exc:
             print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 사용량 조회 실패: {exc!r}")
@@ -233,6 +282,7 @@ def run_scheduler_loop(
                 next_run_at=run_after + interval_min * 60,
                 status="retry_pending",
                 fail_count=1,
+                email=email,
             )
 
         save_queue(queue_path, state_to_dict(states))
@@ -342,8 +392,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.list_accounts:
-        for account_id, status_text, path in accounts.list_accounts():
-            print(f"user{account_id:<4} {status_text:<12} {path}")
+        for account_id, status_text, path, email in accounts.list_accounts():
+            email_text = email or "-"
+            print(f"user{account_id:<4} {status_text:<12} {email_text:<28} {path}")
         return 0
 
     if args.remove_account is not None:
@@ -359,7 +410,9 @@ def main(argv: list[str] | None = None) -> int:
         for account_id in args.account_ids:
             try:
                 plan = accounts.check_paid_subscription(account_id)
-                print(f"[user{account_id}] 유료 구독 확인: {plan}")
+                email = accounts.account_email(account_id)
+                email_suffix = f" ({email})" if email else ""
+                print(f"[user{account_id}] 유료 구독 확인: {plan}{email_suffix}")
             except accounts.AccountStatusError as exc:
                 print(f"[user{account_id}] SKIP: {exc}")
                 continue

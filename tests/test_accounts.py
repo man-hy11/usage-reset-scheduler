@@ -132,6 +132,44 @@ def test_check_paid_subscription_raises_for_free_account(monkeypatch, tmp_path):
         accounts.check_paid_subscription(2)
 
 
+def test_account_email_returns_email_when_present(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    def fake_run(cmd, capture_output, text, env, check):
+        return _FakeCompleted(
+            '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "pro", "email": "user1@example.com"}'
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(accounts, "subprocess", subprocess)
+
+    assert accounts.account_email(1) == "user1@example.com"
+
+
+def test_account_email_returns_none_when_field_absent(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    def fake_run(cmd, capture_output, text, env, check):
+        return _FakeCompleted('{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "pro"}')
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(accounts, "subprocess", subprocess)
+
+    assert accounts.account_email(1) is None
+
+
+def test_account_email_returns_none_instead_of_raising_on_status_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    def fake_run(cmd, capture_output, text, env, check):
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(accounts, "subprocess", subprocess)
+
+    assert accounts.account_email(1) is None
+
+
 def test_add_account_creates_dir_and_runs_login(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     captured = {}
@@ -184,7 +222,7 @@ def test_list_accounts_reports_status_for_each(monkeypatch, tmp_path):
     (tmp_path / ".claude-account-2").mkdir()
 
     responses = {
-        str(tmp_path / ".claude"): '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "pro"}',
+        str(tmp_path / ".claude"): '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "pro", "email": "a@example.com"}',
         str(tmp_path / ".claude-account-2"): '{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "free"}',
     }
 
@@ -200,3 +238,5 @@ def test_list_accounts_reports_status_for_each(monkeypatch, tmp_path):
 
     assert result_by_id[1][1] == "pro"
     assert result_by_id[2][1].startswith("SKIP:")
+    assert result_by_id[1][3] == "a@example.com"
+    assert result_by_id[2][3] is None

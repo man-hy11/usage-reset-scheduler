@@ -65,6 +65,20 @@ def check_paid_subscription(account_id: int) -> str:
     return classify_subscription(status)
 
 
+def account_email(account_id: int) -> str | None:
+    """Best-effort lookup of the logged-in email for account_id.
+
+    Returns None (never raises) when the status call fails or carries no
+    email field — email is informational display data, not a gate.
+    """
+    try:
+        status = run_claude_auth_status(account_id)
+    except AccountStatusError:
+        return None
+    email = status.get("email")
+    return email if isinstance(email, str) and email else None
+
+
 def add_account(account_id: int) -> None:
     path = account_dir(account_id)
     path.mkdir(parents=True, exist_ok=True)
@@ -87,7 +101,7 @@ def remove_account(account_id: int) -> Path:
     return backup
 
 
-def list_accounts() -> list[tuple[int, str, Path]]:
+def list_accounts() -> list[tuple[int, str, Path, str | None]]:
     home = Path.home()
     account_ids = {1}
     for candidate in home.glob(".claude-account-*"):
@@ -102,7 +116,7 @@ def list_accounts() -> list[tuple[int, str, Path]]:
         path = account_dir(account_id)
         try:
             plan = check_paid_subscription(account_id)
-            results.append((account_id, plan, path))
+            results.append((account_id, plan, path, account_email(account_id)))
         except AccountStatusError as exc:
-            results.append((account_id, f"SKIP: {exc}", path))
+            results.append((account_id, f"SKIP: {exc}", path, None))
     return results
