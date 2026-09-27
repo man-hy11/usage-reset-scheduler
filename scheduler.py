@@ -21,6 +21,8 @@ QUEUE_PATH = Path(__file__).parent / ".schedule" / "queue.json"
 REGISTRY_PATH = Path(__file__).parent / ".schedule" / "accounts.json"
 
 FAIL_COUNT_WARN_THRESHOLD = 5
+# free_skip 계정의 유료 전환(free -> paid) 여부를 다시 확인하는 주기(분).
+PLAN_RECHECK_MIN = 60
 
 
 @dataclass
@@ -58,11 +60,11 @@ def _format_when(epoch: int) -> str:
 
 
 def _queue_order_key(item: tuple[int, AccountState]) -> tuple[int, int, int]:
-    """다음 실행 예정 순서로 정렬하는 키. free_skip(next_run_at=None)은 맨 뒤로,
-    같은 next_run_at끼리는 account_id 오름차순으로 묶는다."""
+    """다음 실행 예정 순서로 정렬하는 키. free_skip은 (구독 재확인 시각이
+    있어도) 맨 뒤로, 같은 next_run_at끼리는 account_id 오름차순으로 묶는다."""
     account_id, state = item
-    if state.next_run_at is None:
-        return (1, 0, account_id)
+    if state.status == "free_skip" or state.next_run_at is None:
+        return (1, state.next_run_at or 0, account_id)
     return (0, state.next_run_at, account_id)
 
 
@@ -82,6 +84,8 @@ def format_queue_summary(states: dict[int, AccountState]) -> str:
 
         if state.status == "free_skip":
             lines.append("  상태: free_skip")
+            if state.next_run_at is not None:
+                lines.append(f"  다음 구독 확인: {_format_when(state.next_run_at)}")
             continue
 
         if state.status == "retry_pending":
@@ -126,8 +130,11 @@ def fetch_usage(account_id: int, tool: str) -> dict:
     return usage.fetch_claude_usage(config_dir)
 
 
-def _fetch_usage_fields(account_id: int, tool: str = "claude") -> dict:
-    """Fetch current usage-limit fields, login email and plan for account_id.
+def _fetch_usage_fields(account_id: int, tool: str = "claude", plan: str | None = None) -> dict:
+    """Fetch current usage-limit fields and login email for account_id.
+
+    `plan` is the already-verified result of `check_paid_subscription`; it
+    is passed through as-is so the (network-bound) plan check isn't repeated.
 
     Never raises — this is informational display data only and must not
     block startup or flip a gated account's schedule/status. The usage
@@ -151,11 +158,17 @@ def _fetch_usage_fields(account_id: int, tool: str = "claude") -> dict:
         }
 
     usage_fields["email"] = accounts.account_email(account_id, tool)
-    try:
-        usage_fields["plan"] = accounts.check_paid_subscription(account_id, tool)
-    except accounts.AccountStatusError:
-        usage_fields["plan"] = None
+    usage_fields["plan"] = plan
     return usage_fields
+
+
+def _check_plan(account_id: int, tool: str) -> str | None:
+    """Paid plan name, or None (with a log line) when the account isn't paid."""
+    try:
+        return accounts.check_paid_subscription(account_id, tool)
+    except accounts.AccountStatusError as exc:
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 유료 구독 아님: {exc}")
+        return None
 
 
 def initialize_states(
@@ -165,14 +178,17 @@ def initialize_states(
     now: int,
     existing_states: dict[int, AccountState] | None = None,
     get_tool=None,
+    plan_recheck_seconds: int = PLAN_RECHECK_MIN * 60,
 ) -> dict[int, AccountState]:
     """Build the starting state map for `account_ids`.
 
-    For any account_id already present in `existing_states` with status
-    "scheduled" or "retry_pending", its saved next_run_at/status/fail_count
-    are kept as-is (no fresh `check_paid_subscription` call, no schedule
-    reset) so a scheduler restart doesn't lose mid-flight progress. Every
-    other account_id goes through the normal paid-plan gate check.
+    Every account goes through the paid-plan gate on each startup, because
+    the plan can change between runs (paid -> free or free -> paid). An
+    account that fails it becomes "free_skip" with next_run_at set to the
+    next plan re-check (now + plan_recheck_seconds). For a paid account
+    already present in `existing_states` with status "scheduled" or
+    "retry_pending", its saved next_run_at/status/fail_count are kept as-is
+    so a scheduler restart doesn't lose mid-flight progress.
 
     Regardless of which path an account took above, every non-free_skip
     account gets a fresh usage-limit lookup at startup (even if it already
@@ -192,22 +208,24 @@ def initialize_states(
 
     for account_id in account_ids:
         tool = get_tool(account_id)
-        saved = existing_states.get(account_id)
-        if saved is not None and saved.status in ("scheduled", "retry_pending"):
-            state = dataclasses.replace(saved, tool=tool, **_fetch_usage_fields(account_id, tool))
-            states[account_id] = state
+        plan = _check_plan(account_id, tool)
+        if plan is None:
+            states[account_id] = AccountState(
+                next_run_at=now + plan_recheck_seconds, status="free_skip", tool=tool
+            )
             continue
 
-        try:
-            accounts.check_paid_subscription(account_id, tool)
-        except accounts.AccountStatusError:
-            states[account_id] = AccountState(next_run_at=None, status="free_skip", tool=tool)
+        usage_fields = _fetch_usage_fields(account_id, tool, plan)
+        saved = existing_states.get(account_id)
+        if saved is not None and saved.status in ("scheduled", "retry_pending"):
+            states[account_id] = dataclasses.replace(saved, tool=tool, **usage_fields)
             continue
+
         states[account_id] = AccountState(
             next_run_at=start_at,
             status="scheduled",
             tool=tool,
-            **_fetch_usage_fields(account_id, tool),
+            **usage_fields,
         )
 
     return states
@@ -256,22 +274,27 @@ def run_scheduler_loop(
     sleep_fn,
     now_fn,
     queue_path: Path,
+    plan_recheck_min: int = PLAN_RECHECK_MIN,
 ) -> None:
-    def rebuild_heap():
-        return [
-            (state.next_run_at, account_id)
-            for account_id, state in states.items()
-            if state.status != "free_skip"
-        ]
+    """Run accounts in next_run_at order.
 
-    heap = rebuild_heap()
-    heapq.heapify(heap)
+    free_skip accounts stay in the heap too: their next_run_at is the next
+    plan re-check, and they are promoted to "scheduled" once they turn paid.
+    Scheduled accounts are re-checked right before each run and demoted to
+    free_skip if they are no longer paid.
+    """
+
+    def push_all():
+        for aid, state in states.items():
+            if state.next_run_at is not None:
+                heapq.heappush(heap, (state.next_run_at, aid))
+
+    heap = []
+    push_all()
 
     while heap:
         next_run_at, account_id = heapq.heappop(heap)
 
-        if states[account_id].status == "free_skip":
-            continue
         if states[account_id].next_run_at != next_run_at:
             # 재시도 처리 등으로 이미 갱신된 오래된 힙 항목이므로 버린다.
             continue
@@ -282,16 +305,40 @@ def run_scheduler_loop(
         print(format_queue_summary(states))
 
         current = states[account_id]
-        if current.status != "scheduled" or current.next_run_at != next_run_at:
-            for aid, state in states.items():
-                if state.status != "free_skip":
-                    heapq.heappush(heap, (state.next_run_at, aid))
+        if current.status == "retry_pending" or current.next_run_at != next_run_at:
+            push_all()
             if heap:
                 sleep_fn(max(0, heap[0][0] - now_fn()))
             continue
 
         wait_seconds = max(0, current.next_run_at - now_fn())
         sleep_fn(wait_seconds)
+
+        plan = _check_plan(account_id, current.tool)
+        checked_at = now_fn()
+        if plan is None:
+            if current.status == "scheduled":
+                print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 무료 전환 감지 → free_skip")
+            states[account_id] = AccountState(
+                next_run_at=checked_at + plan_recheck_min * 60,
+                status="free_skip",
+                tool=current.tool,
+            )
+            save_queue(queue_path, state_to_dict(states))
+            push_all()
+            continue
+        if current.status == "free_skip":
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 유료 전환 감지({plan}) → 바로 실행")
+            states[account_id] = AccountState(
+                next_run_at=checked_at,
+                status="scheduled",
+                tool=current.tool,
+                **_fetch_usage_fields(account_id, current.tool, plan),
+            )
+            save_queue(queue_path, state_to_dict(states))
+            push_all()
+            continue
+        current.plan = plan
 
         success = run_claude_fn(account_id)
         if not success:
@@ -329,9 +376,7 @@ def run_scheduler_loop(
 
         save_queue(queue_path, state_to_dict(states))
 
-        for aid, state in states.items():
-            if state.status != "free_skip":
-                heapq.heappush(heap, (state.next_run_at, aid))
+        push_all()
 
 
 DEFAULT_MODEL = {"claude": "claude-haiku-4-5", "codex": "gpt-6-luna"}

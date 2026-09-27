@@ -7,6 +7,19 @@ import subprocess
 import accounts
 
 
+# 원본 함수는 아래 live-plan 테스트에서 직접 검증하기 위해 보관해 둔다.
+_real_fetch_claude_live_plan = accounts.fetch_claude_live_plan
+_real_fetch_codex_live_plan = accounts.fetch_codex_live_plan
+
+
+@pytest.fixture(autouse=True)
+def _no_live_plan_lookup(monkeypatch):
+    # 실시간 구독 조회는 네트워크를 타므로 기본은 "정보 없음"(None)으로 막아
+    # 로컬 subscriptionType만으로 판단하게 한다. 필요한 테스트만 덮어쓴다.
+    monkeypatch.setattr(accounts, "fetch_claude_live_plan", lambda config_dir: None)
+    monkeypatch.setattr(accounts, "fetch_codex_live_plan", lambda config_dir: None)
+
+
 def test_account_dir_for_account_1_is_dot_claude(monkeypatch, tmp_path):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     assert accounts.account_dir(1) == tmp_path / ".claude"
@@ -392,3 +405,155 @@ def test_list_accounts_discovers_codex_dirs_and_uses_get_tool(monkeypatch, tmp_p
     assert result_by_id[4][1] == "plus"
     assert result_by_id[4][3] == "b@example.com"
     assert result_by_id[4][2] == account4_dir
+
+
+import time
+
+
+class _FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise accounts.requests.HTTPError(f"{self.status_code} error")
+
+    def json(self):
+        return self._payload
+
+
+def _fake_claude_auth_status(monkeypatch, subscription_type):
+    payload = json.dumps(
+        {"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": subscription_type}
+    )
+    monkeypatch.setattr(subprocess, "run", lambda cmd, capture_output, text, env, check: _FakeCompleted(payload))
+
+
+def test_check_paid_subscription_detects_downgrade_despite_stale_local_pro(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _fake_claude_auth_status(monkeypatch, "pro")
+    monkeypatch.setattr(accounts, "fetch_claude_live_plan", lambda config_dir: "free")
+
+    with pytest.raises(accounts.AccountStatusError, match="free"):
+        accounts.check_paid_subscription(1)
+
+
+def test_check_paid_subscription_detects_upgrade_despite_stale_local_free(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _fake_claude_auth_status(monkeypatch, "free")
+    monkeypatch.setattr(accounts, "fetch_claude_live_plan", lambda config_dir: "max")
+
+    assert accounts.check_paid_subscription(2) == "max"
+
+
+def test_check_paid_subscription_falls_back_to_local_plan_when_live_lookup_fails(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _fake_claude_auth_status(monkeypatch, "pro")
+
+    def boom(config_dir):
+        raise accounts.requests.HTTPError("429 Too Many Requests")
+
+    monkeypatch.setattr(accounts, "fetch_claude_live_plan", boom)
+
+    assert accounts.check_paid_subscription(1) == "pro"
+    assert "실시간 구독 조회 실패" in capsys.readouterr().err
+
+
+def test_check_paid_subscription_codex_detects_downgrade_via_live_plan(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _write_codex_auth(
+        tmp_path / ".codex",
+        {"email": "a@example.com", "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"}},
+    )
+    monkeypatch.setattr(accounts, "fetch_codex_live_plan", lambda config_dir: "free")
+
+    with pytest.raises(accounts.AccountStatusError, match="free"):
+        accounts.check_paid_subscription(1, tool="codex")
+
+
+def test_check_paid_subscription_skips_live_lookup_when_logged_out(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd, capture_output, text, env, check: _FakeCompleted('{"loggedIn": false}')
+    )
+
+    def fail_if_called(config_dir):
+        raise AssertionError("live plan lookup should not run for a logged-out account")
+
+    monkeypatch.setattr(accounts, "fetch_claude_live_plan", fail_if_called)
+
+    with pytest.raises(accounts.AccountStatusError, match="로그인"):
+        accounts.check_paid_subscription(1)
+
+
+@pytest.mark.parametrize(
+    "org_type, expected",
+    [("claude_free", "free"), ("claude_pro", "pro"), ("claude_max", "max"), ("", None)],
+)
+def test_fetch_claude_live_plan_maps_organization_type(monkeypatch, tmp_path, org_type, expected):
+    (tmp_path / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "tok"}}))
+    captured = {}
+
+    def fake_get(url, headers, timeout):
+        captured["url"] = url
+        captured["auth"] = headers["Authorization"]
+        return _FakeResponse({"organization": {"organization_type": org_type}})
+
+    monkeypatch.setattr(accounts.requests, "get", fake_get)
+
+    assert _real_fetch_claude_live_plan(tmp_path) == expected
+    assert captured["url"] == accounts.CLAUDE_PROFILE_URL
+    assert captured["auth"] == "Bearer tok"
+
+
+def test_fetch_claude_live_plan_raises_on_http_error(monkeypatch, tmp_path):
+    (tmp_path / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "tok"}}))
+    monkeypatch.setattr(accounts.requests, "get", lambda url, headers, timeout: _FakeResponse({}, status_code=429))
+
+    with pytest.raises(accounts.requests.HTTPError):
+        _real_fetch_claude_live_plan(tmp_path)
+
+
+def test_fetch_codex_live_plan_reads_plan_type(monkeypatch, tmp_path):
+    (tmp_path / "auth.json").write_text(json.dumps({"tokens": {"access_token": "at-1"}}))
+    monkeypatch.setattr(
+        accounts.requests, "get", lambda url, headers, timeout: _FakeResponse({"plan_type": "Plus"})
+    )
+
+    assert _real_fetch_codex_live_plan(tmp_path) == "plus"
+
+
+def _write_claude_credentials(config_dir: Path, expires_at_ms: int) -> None:
+    (config_dir / ".credentials.json").write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "tok", "expiresAt": expires_at_ms}})
+    )
+
+
+def test_fetch_claude_live_plan_treats_401_on_unexpired_token_as_revoked(monkeypatch, tmp_path):
+    _write_claude_credentials(tmp_path, int((time.time() + 3600) * 1000))
+    monkeypatch.setattr(accounts.requests, "get", lambda url, headers, timeout: _FakeResponse({}, status_code=401))
+
+    with pytest.raises(accounts.AccountStatusError, match="폐기"):
+        _real_fetch_claude_live_plan(tmp_path)
+
+
+def test_fetch_claude_live_plan_treats_401_on_expired_token_as_transient(monkeypatch, tmp_path):
+    _write_claude_credentials(tmp_path, int((time.time() - 60) * 1000))
+    monkeypatch.setattr(accounts.requests, "get", lambda url, headers, timeout: _FakeResponse({}, status_code=401))
+
+    with pytest.raises(accounts.requests.HTTPError):
+        _real_fetch_claude_live_plan(tmp_path)
+
+
+def test_check_paid_subscription_rejects_revoked_token_instead_of_falling_back(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _fake_claude_auth_status(monkeypatch, "pro")
+
+    def revoked(config_dir):
+        raise accounts.AccountStatusError("OAuth 토큰이 폐기됨, 재로그인 필요 (401)")
+
+    monkeypatch.setattr(accounts, "fetch_claude_live_plan", revoked)
+
+    with pytest.raises(accounts.AccountStatusError, match="폐기"):
+        accounts.check_paid_subscription(1)

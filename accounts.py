@@ -12,10 +12,18 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
+import requests
+
+import usage
+
 PAID_PLANS = {"pro", "max", "team", "enterprise"}
+
+CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 
 # Codex(ChatGPT) 쪽 subscriptionType 동급 값. free/unknown은 게이트 통과 못 함.
 CODEX_PAID_PLANS = {"plus", "pro", "team", "business", "enterprise"}
@@ -112,8 +120,85 @@ def run_claude_auth_status(account_id: int, tool: str = "claude") -> dict:
         raise AccountStatusError("인증 상태 JSON 파싱 실패") from exc
 
 
+def fetch_claude_live_plan(config_dir: Path) -> str | None:
+    """Current plan straight from the OAuth profile endpoint.
+
+    `claude auth status`/.credentials.json keep the subscriptionType from
+    login time, so they miss upgrades and downgrades done afterwards. The
+    profile endpoint's organization_type ("claude_pro", "claude_free", ...)
+    reflects the live subscription. Returns e.g. "pro"/"free", or None when
+    the response carries no organization_type. Raises AccountStatusError
+    when the server rejects a not-yet-expired token (revoked — e.g. after a
+    downgrade or logout elsewhere), and other exceptions on network/HTTP/
+    token-file errors.
+    """
+    token = usage.read_claude_token(config_dir)
+    response = requests.get(
+        CLAUDE_PROFILE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+        timeout=20,
+    )
+    if response.status_code == 401 and not _claude_token_expired(config_dir):
+        # 만료 전 토큰이 거부됐다면 폐기된 것 — `claude` 실행으로도 갱신되지 않는다.
+        # (이미 만료된 토큰의 401은 다음 실행 때 refresh될 수 있으므로 일반 오류로 둔다.)
+        raise AccountStatusError("OAuth 토큰이 폐기됨, 재로그인 필요 (401)")
+    response.raise_for_status()
+    organization = response.json().get("organization") or {}
+    org_type = str(organization.get("organization_type") or "").lower()
+    return org_type.removeprefix("claude_") or None
+
+
+def _claude_token_expired(config_dir: Path) -> bool:
+    credentials = json.loads((config_dir / ".credentials.json").read_text())
+    expires_at_ms = credentials["claudeAiOauth"].get("expiresAt")
+    return expires_at_ms is None or expires_at_ms / 1000 <= time.time()
+
+
+def fetch_codex_live_plan(config_dir: Path) -> str | None:
+    """Current ChatGPT plan from the usage endpoint's plan_type.
+
+    The id_token's chatgpt_plan_type claim is only as fresh as the last
+    token refresh, so it can lag behind an upgrade/downgrade. Returns e.g.
+    "plus"/"free", or None when plan_type is missing. Raises on
+    network/HTTP/token errors.
+    """
+    token = usage.read_codex_token(config_dir)
+    response = requests.get(
+        usage.CODEX_USAGE_URL,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    plan = str(response.json().get("plan_type") or "").lower()
+    return plan or None
+
+
 def check_paid_subscription(account_id: int, tool: str = "claude") -> str:
+    """Return the paid plan name, or raise AccountStatusError.
+
+    Login state comes from the local auth status; the plan itself is taken
+    from the live API when reachable so upgrades (free -> paid) and
+    downgrades (paid -> free) are both picked up without re-login. Falls
+    back to the locally cached plan when the live lookup fails.
+    """
     status = run_claude_auth_status(account_id, tool)
+    if status.get("loggedIn") is True:
+        fetch_live_plan = fetch_codex_live_plan if tool == "codex" else fetch_claude_live_plan
+        try:
+            live_plan = fetch_live_plan(account_dir(account_id, tool))
+        except AccountStatusError:
+            raise
+        except Exception as exc:
+            live_plan = None
+            print(
+                f"[account {account_id}] 실시간 구독 조회 실패, 로컬 정보(subscriptionType)로 판단: {exc!r}",
+                file=sys.stderr,
+            )
+        if live_plan is not None:
+            status = {**status, "subscriptionType": live_plan}
     return classify_subscription(status)
 
 

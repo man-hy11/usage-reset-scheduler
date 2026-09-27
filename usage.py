@@ -9,6 +9,9 @@ import requests
 
 MAX_SLEEP_SECONDS = 691_200  # 8일
 
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+
 
 def read_claude_token(config_dir: Path) -> str:
     credentials_path = config_dir / ".credentials.json"
@@ -27,7 +30,7 @@ def read_codex_token(config_dir: Path) -> str:
 def fetch_claude_usage(config_dir: Path) -> dict:
     token = read_claude_token(config_dir)
     response = requests.get(
-        "https://api.anthropic.com/api/oauth/usage",
+        CLAUDE_USAGE_URL,
         headers={
             "Authorization": f"Bearer {token}",
             "anthropic-beta": "oauth-2025-04-20",
@@ -53,7 +56,7 @@ def fetch_claude_usage(config_dir: Path) -> dict:
 def fetch_codex_usage(config_dir: Path) -> dict:
     token = read_codex_token(config_dir)
     response = requests.get(
-        "https://chatgpt.com/backend-api/wham/usage",
+        CODEX_USAGE_URL,
         headers={"Authorization": f"Bearer {token}"},
         timeout=20,
     )
