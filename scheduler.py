@@ -26,6 +26,10 @@ class AccountState:
     next_run_at: int | None
     status: str  # "scheduled" | "retry_pending" | "free_skip"
     fail_count: int = 0
+    five_hour_used_percent: float | None = None
+    five_hour_reset_at: int | None = None
+    weekly_used_percent: float | None = None
+    weekly_reset_at: int | None = None
 
 
 def state_to_dict(states: dict[int, AccountState]) -> dict:
@@ -44,18 +48,34 @@ def state_from_dict(raw: dict) -> dict[int, AccountState]:
     return result
 
 
+def _format_when(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def format_queue_summary(states: dict[int, AccountState]) -> str:
     parts = []
     for account_id in sorted(states):
         state = states[account_id]
         if state.status == "free_skip":
             parts.append(f"user{account_id}(free_skip)")
-        elif state.status == "retry_pending":
-            when = datetime.fromtimestamp(state.next_run_at).strftime("%H:%M:%S")
-            parts.append(f"user{account_id}(retry_pending, 다음 {when}, 실패 {state.fail_count}회)")
+            continue
+
+        when = _format_when(state.next_run_at)
+        if state.status == "retry_pending":
+            entry = f"user{account_id}(retry_pending, 다음 {when}, 실패 {state.fail_count}회"
         else:
-            when = datetime.fromtimestamp(state.next_run_at).strftime("%H:%M:%S")
-            parts.append(f"user{account_id}({state.status}, 다음 {when})")
+            entry = f"user{account_id}({state.status}, 다음 {when}"
+
+        if state.five_hour_used_percent is not None and state.five_hour_reset_at is not None:
+            entry += (
+                f", 5시간 {state.five_hour_used_percent:g}% 리셋 {_format_when(state.five_hour_reset_at)}"
+            )
+        if state.weekly_used_percent is not None and state.weekly_reset_at is not None:
+            entry += (
+                f", 주간 {state.weekly_used_percent:g}% 리셋 {_format_when(state.weekly_reset_at)}"
+            )
+
+        parts.append(entry + ")")
     return "큐 상태: " + " ".join(parts)
 
 
@@ -134,6 +154,10 @@ def retry_pending_accounts(
         state.status = "scheduled"
         state.fail_count = 0
         state.next_run_at = now + seconds
+        state.five_hour_used_percent = status.get("five_hour_used_percent")
+        state.five_hour_reset_at = status.get("five_hour_reset_at")
+        state.weekly_used_percent = status.get("weekly_used_percent")
+        state.weekly_reset_at = status.get("weekly_reset_at")
 
     return states
 
@@ -195,7 +219,13 @@ def run_scheduler_loop(
             status = usage.fetch_claude_usage(config_dir)
             seconds = usage.compute_next_run(status, threshold, fallback_min, run_after)
             states[account_id] = AccountState(
-                next_run_at=run_after + seconds, status="scheduled", fail_count=0
+                next_run_at=run_after + seconds,
+                status="scheduled",
+                fail_count=0,
+                five_hour_used_percent=status.get("five_hour_used_percent"),
+                five_hour_reset_at=status.get("five_hour_reset_at"),
+                weekly_used_percent=status.get("weekly_used_percent"),
+                weekly_reset_at=status.get("weekly_reset_at"),
             )
         except Exception as exc:
             print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [account {account_id}] 사용량 조회 실패: {exc!r}")
@@ -332,6 +362,24 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[user{account_id}] 유료 구독 확인: {plan}")
             except accounts.AccountStatusError as exc:
                 print(f"[user{account_id}] SKIP: {exc}")
+                continue
+
+            try:
+                config_dir = accounts.account_dir(account_id)
+                status = usage.fetch_claude_usage(config_dir)
+            except Exception as exc:
+                print(f"[user{account_id}]   사용량 조회 실패: {exc!r}")
+                continue
+
+            five_pct = status.get("five_hour_used_percent")
+            five_reset = status.get("five_hour_reset_at")
+            week_pct = status.get("weekly_used_percent")
+            week_reset = status.get("weekly_reset_at")
+
+            if five_pct is not None and five_reset is not None:
+                print(f"[user{account_id}]   5시간 한도: {five_pct:g}% 사용, 리셋 {_format_when(five_reset)}")
+            if week_pct is not None and week_reset is not None:
+                print(f"[user{account_id}]   주간 한도: {week_pct:g}% 사용, 리셋 {_format_when(week_reset)}")
         return 0
 
     if args.delay < 0 or args.interval < 0:

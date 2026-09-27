@@ -1,6 +1,7 @@
 import heapq
 import json as _json
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,32 @@ def test_state_round_trip_through_dict():
 
     assert restored[1] == states[1]
     assert restored[2] == states[2]
+
+
+def test_state_round_trip_preserves_usage_limit_fields():
+    states = {
+        1: scheduler.AccountState(
+            next_run_at=1000,
+            status="scheduled",
+            five_hour_used_percent=42,
+            five_hour_reset_at=1790496059,
+            weekly_used_percent=17,
+            weekly_reset_at=1791073800,
+        ),
+    }
+    raw = scheduler.state_to_dict(states)
+    restored = scheduler.state_from_dict(raw)
+
+    assert restored[1] == states[1]
+
+
+def test_state_from_dict_defaults_usage_limit_fields_to_none_when_absent():
+    # 이 필드들이 추가되기 전에 저장된 기존 queue.json과의 하위 호환성.
+    raw = {"1": {"next_run_at": 1000, "status": "scheduled", "fail_count": 0}}
+    restored = scheduler.state_from_dict(raw)
+
+    assert restored[1].five_hour_used_percent is None
+    assert restored[1].weekly_reset_at is None
 
 
 def test_save_and_load_queue_round_trip(tmp_path):
@@ -89,6 +116,10 @@ def test_retry_pending_accounts_promotes_on_success(monkeypatch):
     assert result[1].status == "scheduled"
     assert result[1].fail_count == 0
     assert result[1].next_run_at == 1500  # now + compute_next_run
+    assert result[1].five_hour_used_percent == 5
+    assert result[1].five_hour_reset_at == 2000
+    assert result[1].weekly_used_percent == 10
+    assert result[1].weekly_reset_at == 9999
 
 
 def test_retry_pending_accounts_keeps_retrying_on_failure(monkeypatch):
@@ -204,6 +235,62 @@ def test_run_scheduler_loop_runs_claude_sequentially_in_next_run_order(monkeypat
 
     assert call_order == [2, 1]
     assert sleep_calls == [0, 100]  # account2: 100-100=0 대기, account1: 200-100=100 대기
+
+
+def test_run_scheduler_loop_stores_usage_limits_after_successful_run(monkeypatch, tmp_path):
+    states = {
+        1: scheduler.AccountState(next_run_at=100, status="scheduled"),
+    }
+
+    class _StopLoop(Exception):
+        pass
+
+    def fake_run_claude(account_id):
+        return True
+
+    def fake_fetch(config_dir):
+        return {
+            "five_hour_used_percent": 42,
+            "five_hour_reset_at": 1790496059,
+            "weekly_used_percent": 17,
+            "weekly_reset_at": 1791073800,
+        }
+
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
+    monkeypatch.setattr(usage, "compute_next_run", lambda status, threshold, fallback_min, now: 999999)
+
+    now_box = {"t": 100}
+
+    def fake_now():
+        return now_box["t"]
+
+    call_count = {"n": 0}
+
+    def fake_sleep(seconds):
+        call_count["n"] += 1
+        now_box["t"] += seconds
+        if call_count["n"] >= 2:
+            # 1번째 sleep은 claude 실행 전 대기, 2번째는 claude 실행+사용량
+            # 갱신이 끝난 뒤 다음 루프 반복에서 발생 — 그 시점에 멈춘다.
+            raise _StopLoop()
+
+    with pytest.raises(_StopLoop):
+        scheduler.run_scheduler_loop(
+            states,
+            interval_min=5,
+            threshold=100,
+            fallback_min=305,
+            run_claude_fn=fake_run_claude,
+            sleep_fn=fake_sleep,
+            now_fn=fake_now,
+            queue_path=tmp_path / "queue.json",
+        )
+
+    assert states[1].five_hour_used_percent == 42
+    assert states[1].five_hour_reset_at == 1790496059
+    assert states[1].weekly_used_percent == 17
+    assert states[1].weekly_reset_at == 1791073800
 
 
 def test_parse_args_defaults_to_account_1_when_none_given():
@@ -379,6 +466,17 @@ def test_run_claude_skips_non_dict_event_field_and_still_extracts_valid_text_del
 
 def test_main_check_subscription_prints_plan_and_returns_zero(monkeypatch, capsys):
     monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(
+        usage,
+        "fetch_claude_usage",
+        lambda config_dir: {
+            "five_hour_used_percent": None,
+            "five_hour_reset_at": None,
+            "weekly_used_percent": None,
+            "weekly_reset_at": None,
+        },
+    )
 
     rc = scheduler.main(["1", "--check-subscription"])
 
@@ -398,6 +496,48 @@ def test_main_check_subscription_reports_skip_for_free_plan(monkeypatch, capsys)
     captured = capsys.readouterr()
     assert rc == 0
     assert "SKIP" in captured.out
+
+
+def test_main_check_subscription_includes_usage_limits(monkeypatch, capsys):
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+    monkeypatch.setattr(
+        usage,
+        "fetch_claude_usage",
+        lambda config_dir: {
+            "five_hour_used_percent": 42,
+            "five_hour_reset_at": 1790496059,
+            "weekly_used_percent": 17,
+            "weekly_reset_at": 1791073800,
+        },
+    )
+
+    rc = scheduler.main(["1", "--check-subscription"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "42%" in captured.out
+    assert "17%" in captured.out
+    expected_five_date = datetime.fromtimestamp(1790496059).strftime("%Y-%m-%d")
+    expected_week_date = datetime.fromtimestamp(1791073800).strftime("%Y-%m-%d")
+    assert expected_five_date in captured.out
+    assert expected_week_date in captured.out
+
+
+def test_main_check_subscription_reports_usage_fetch_failure_without_crashing(monkeypatch, capsys):
+    monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id: "pro")
+    monkeypatch.setattr(accounts, "account_dir", lambda account_id: Path(f"/fake/{account_id}"))
+
+    def fake_fetch(config_dir):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(usage, "fetch_claude_usage", fake_fetch)
+
+    rc = scheduler.main(["1", "--check-subscription"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "사용량 조회 실패" in captured.out
 
 
 def test_main_list_accounts_routes_to_accounts_module(monkeypatch, capsys, tmp_path):
@@ -766,6 +906,23 @@ def test_format_queue_summary_shows_each_account_status():
     assert "실패 3회" in summary
 
 
+def test_format_queue_summary_includes_date_not_just_time_of_day():
+    # 다음 실행이 날짜가 바뀔 만큼 먼 미래(예: 주간 리셋)일 수 있으므로,
+    # 시:분:초만 찍으면 "오늘인지 며칠 뒤인지" 구분이 안 되는 버그가 된다.
+    from datetime import datetime
+
+    next_run_at = 1790496059
+    expected_date = datetime.fromtimestamp(next_run_at).strftime("%Y-%m-%d")
+
+    states = {
+        1: scheduler.AccountState(next_run_at=next_run_at, status="scheduled"),
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert expected_date in summary
+
+
 def test_format_queue_summary_orders_by_account_id():
     states = {
         3: scheduler.AccountState(next_run_at=100, status="scheduled"),
@@ -776,6 +933,36 @@ def test_format_queue_summary_orders_by_account_id():
     summary = scheduler.format_queue_summary(states)
 
     assert summary.index("user1") < summary.index("user2") < summary.index("user3")
+
+
+def test_format_queue_summary_includes_usage_limits_when_known():
+    states = {
+        1: scheduler.AccountState(
+            next_run_at=1790496059,
+            status="scheduled",
+            five_hour_used_percent=42,
+            five_hour_reset_at=1790496059,
+            weekly_used_percent=17,
+            weekly_reset_at=1791073800,
+        ),
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert "5시간 42%" in summary
+    assert "주간 17%" in summary
+
+
+def test_format_queue_summary_omits_usage_limits_when_unknown():
+    states = {
+        2: scheduler.AccountState(next_run_at=None, status="free_skip"),
+    }
+
+    summary = scheduler.format_queue_summary(states)
+
+    assert "user2(free_skip)" in summary
+    assert "5시간" not in summary
+    assert "주간" not in summary
 
 
 def test_run_scheduler_loop_prints_queue_summary_each_iteration(monkeypatch, tmp_path, capsys):
