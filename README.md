@@ -13,7 +13,7 @@ Claude Code(`claude` CLI)와 Codex CLI(`codex`)를 여러 계정에 걸쳐 최�
 ## 빠른 시작
 
 ```bash
-# 계정 미지정 시 user1(~/.claude, claude 도구)을 대상으로 실행
+# 계정 미지정 시 user1(claude 도구)을 대상으로 실행
 python3 scheduler.py
 
 # 여러 계정을 동시에 스케줄에 등록 (순차 실행, 동시에 두 계정을 실행하지 않음)
@@ -37,6 +37,7 @@ python3 scheduler.py 1 -w "2026-10-01 09:00"
 - 호출 후 사용량을 재조회해 다음 실행 시각을 계산합니다: 주간 한도가 임계치 이상 소진됐으면 주간 리셋 + 1분, 그 외에는 5시간 리셋 + 1분.
 - 사용량 조회가 실패한 계정은 `retry_pending` 상태로 남아 `--interval`분 간격으로 재시도합니다. 큐에서 어떤 계정이든 다음 차례로 뽑힐 때마다, 그 시점에 실패 이력이 있는 계정들도 먼저 재조회를 시도합니다. 실패가 반복돼도 포기하지 않고 계속 재시도합니다(5회부터는 로그 심각도만 올라감).
 - 스케줄 상태는 `.schedule/queue.json`에 매 주기 저장되며, 재시작 시 이 파일을 읽어 기존 스케줄을 복원합니다(구독 확인은 매번 새로 하고, 여전히 유료인 계정은 저장된 `scheduled`/`retry_pending` 상태를 그대로 이어받습니다).
+- 모든 Claude 계정(user1 포함)은 `~/.claude`의 설정을 공유합니다. `settings.json`, `CLAUDE.md`, `skills`, `plugins`, `commands`, `agents`, `hud`, `statusline*`은 계정 폴더 안에 `~/.claude`로의 심볼릭 링크로 연결되어 `~/.claude` 쪽 변경이 모든 계정에 즉시 반영됩니다(기존 파일은 `.pre-shared-<시각>/`에 백업). user 범위 MCP 서버(`~/.claude.json`의 `mcpServers`)는 로그인 정보와 같은 파일에 있어 링크할 수 없으므로 스케줄러 시작 시와 `--add-account` 시 각 계정의 `.claude.json`으로 복사됩니다. claude.ai 커넥터(Google Drive 등)는 계정 단위라 공유되지 않습니다. 스케줄러의 호출은 `--strict-mcp-config`로 MCP 서버를 띄우지 않습니다.
 - 각 계정이 어느 도구(claude/codex)인지는 `.schedule/accounts.json`에 저장됩니다 — `--add-account`로 등록할 때 결정됩니다. 등록된 적 없는 계정 번호는 하위 호환을 위해 기본적으로 `claude`로 취급합니다.
 - 큐를 한 바퀴 돌 때마다(계정 하나를 처리할 때마다) 전체 계정의 현재 상태를 콘솔에 출력합니다. 시작 시(재시작 포함) 각 계정의 로그인 이메일·구독 플랜·최신 한도를 한 번 조회해 채워 넣고, 이후 매 실행마다 갱신합니다. 시각은 날짜까지 포함합니다(주간 리셋은 오늘과 최대 7일 차이 날 수 있으므로 시:분:초만으로는 언제인지 구분할 수 없기 때문입니다):
   ```
@@ -64,10 +65,9 @@ python3 scheduler.py 1 -w "2026-10-01 09:00"
 
 | 계정 번호 | claude 설정 디렉터리 | codex 설정 디렉터리 |
 |---|---|---|
-| `1` | `~/.claude` (CLI 기본값) | `~/.codex` (CLI 기본값) |
-| `N` (2 이상) | `~/.usage-reset-scheduler/accounts/claude-N` | `~/.usage-reset-scheduler/accounts/codex-N` |
+| `N` (1 포함) | `~/.usage-reset-scheduler/accounts/claude-N` | `~/.usage-reset-scheduler/accounts/codex-N` |
 
-`user1`은 각 CLI의 기본 설정 위치를 그대로 쓰고, 추가 계정(`N≥2`)은 홈 디렉터리를 어지럽히지 않도록 `~/.usage-reset-scheduler/accounts/` 아래에 모아둡니다.
+모든 계정이 같은 규칙을 쓰며, `user1`도 예외가 아닙니다. **`~/.claude`와 `~/.codex`는 스케줄러 계정이 아닙니다** — 사용자가 직접 `claude`/`codex`를 실행할 때 쓰는 폴더이므로 스케줄러가 쓰지 않습니다(공유 설정의 원본으로만 읽습니다). 이렇게 분리하면 스케줄러의 일회성 `-p` 호출이 사용자의 인증 정보·세션 기록·실행 로그와 섞이지 않습니다. 같은 `.credentials.json`을 두 프로세스가 각자 갱신하다 토큰이 무효화되는 일도 막습니다.
 
 같은 계정 번호를 claude와 codex 양쪽에 동시에 등록할 수는 없습니다 — 번호 하나는 등록 시점에 결정된 도구 하나에만 대응합니다.
 
@@ -93,7 +93,7 @@ python3 scheduler.py --remove-account 2   # 또는: python3 scheduler.py -r 2
 
 `--list-accounts` 출력 예:
 ```
-user1    [claude] pro          user1@example.com         ~/.claude
+user1    [claude] pro          user1@example.com         ~/.usage-reset-scheduler/accounts/claude-1
 user2    [claude] pro          user2@example.com      ~/.usage-reset-scheduler/accounts/claude-2
 user4    [codex ] plus         user4@example.com            ~/.usage-reset-scheduler/accounts/codex-4
 user5    [claude] SKIP: 인증 상태 확인 실패 -                            ~/.usage-reset-scheduler/accounts/claude-5

@@ -17,6 +17,8 @@ def _default_paid_plan(monkeypatch):
     # 구독 게이트는 실제 `claude auth status`와 네트워크를 호출하므로,
     # 테스트가 따로 지정하지 않으면 항상 유료("pro")로 고정한다.
     monkeypatch.setattr(accounts, "check_paid_subscription", lambda account_id, tool="claude": "pro")
+    # main()이 실제 홈 디렉터리의 계정 폴더를 건드리지 않도록 막는다.
+    monkeypatch.setattr(accounts, "share_claude_config_all", lambda: {})
 
 
 def test_state_round_trip_through_dict():
@@ -426,6 +428,7 @@ def test_build_claude_command_shape():
     assert cmd == [
         "claude",
         "--dangerously-skip-permissions",
+        "--strict-mcp-config",
         "--model", "claude-haiku-4-5",
         "--effort", "low",
         "-p",
@@ -434,6 +437,56 @@ def test_build_claude_command_shape():
         "--include-partial-messages",
         "Reply with OK.",
     ]
+
+
+@pytest.mark.parametrize("account_id", [1, 2])
+def test_run_claude_always_sets_config_dir_including_account_1(monkeypatch, tmp_path, account_id):
+    # user1도 전용 폴더를 쓴다 — 사용자의 ~/.claude를 물려받으면 인증 정보와
+    # 세션 기록이 섞인다.
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/should/be/overridden")
+    captured = {}
+
+    class _FakeCompletedProcess:
+        stdout = ""
+        returncode = 0
+
+    def fake_run(cmd, env, capture_output, text):
+        captured["env"] = env
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(scheduler, "subprocess", subprocess)
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id, tool="claude": tmp_path)
+
+    scheduler.run_claude(account_id, "claude-haiku-4-5", "low")
+
+    expected = tmp_path / ".usage-reset-scheduler" / "accounts" / f"claude-{account_id}"
+    assert captured["env"]["CLAUDE_CONFIG_DIR"] == str(expected)
+
+
+@pytest.mark.parametrize("account_id", [1, 4])
+def test_run_codex_always_sets_codex_home_including_account_1(monkeypatch, tmp_path, account_id):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("CODEX_HOME", "/should/be/overridden")
+    captured = {}
+
+    class _FakeCompletedProcess:
+        stdout = ""
+        returncode = 0
+
+    def fake_run(cmd, env, capture_output, text):
+        captured["env"] = env
+        return _FakeCompletedProcess()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(scheduler, "subprocess", subprocess)
+    monkeypatch.setattr(scheduler, "log_dir_for_account", lambda account_id, tool="codex": tmp_path)
+
+    scheduler.run_codex(account_id, "gpt-6-luna", "low")
+
+    expected = tmp_path / ".usage-reset-scheduler" / "accounts" / f"codex-{account_id}"
+    assert captured["env"]["CODEX_HOME"] == str(expected)
 
 
 def test_run_claude_extracts_text_deltas_and_returns_true_on_success(monkeypatch, tmp_path):

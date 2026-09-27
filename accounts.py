@@ -1,5 +1,10 @@
 """Claude/Codex 계정 디렉터리 규칙, 구독 게이트, 계정 관리.
 
+스케줄러가 쓰는 계정 폴더는 user 번호와 무관하게 모두
+~/.usage-reset-scheduler/accounts/ 아래에 있다. 사용자가 직접 `claude`를
+실행할 때 쓰는 ~/.claude는 스케줄러 계정이 아니며, 공유 설정의 원본으로만
+읽는다(쓰지 않는다).
+
 account_id는 도구별로 별도 네임스페이스가 아니라 registry.py가 관리하는
 전역 매핑(userN -> "claude"|"codex")을 통해 어느 도구인지 결정된다. 이
 모듈의 함수들은 그 결과인 `tool` 문자열을 파라미터로 받는다 — 이 모듈
@@ -23,6 +28,21 @@ import usage
 
 PAID_PLANS = {"pro", "max", "team", "enterprise"}
 
+# 스케줄러 계정이 ~/.claude(사용자가 직접 쓰는 설정)와 공유하는 항목.
+# 계정 폴더 안에 원본으로의 심볼릭 링크를 두므로 ~/.claude 쪽 변경이 모든
+# 계정에 즉시 반영된다. 인증·세션·히스토리 등 계정별 상태는 공유하지 않는다.
+SHARED_CLAUDE_ENTRIES = (
+    "settings.json",
+    "CLAUDE.md",
+    "skills",
+    "plugins",
+    "commands",
+    "agents",
+    "hud",
+    "statusline",
+    "statusline-command.sh",
+)
+
 CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 
 # Codex(ChatGPT) 쪽 subscriptionType 동급 값. free/unknown은 게이트 통과 못 함.
@@ -34,8 +54,12 @@ class AccountStatusError(Exception):
 
 
 def account_dir(account_id: int, tool: str = "claude") -> Path:
-    if account_id == 1:
-        return Path.home() / (".codex" if tool == "codex" else ".claude")
+    """Config dir for a scheduler account — uniform for every account_id.
+
+    user1 is NOT ~/.claude / ~/.codex: those stay reserved for the user's
+    own interactive runs, so the scheduler's throwaway `-p` calls don't
+    share credentials, history or session state with them.
+    """
     return Path.home() / ".usage-reset-scheduler" / "accounts" / f"{tool}-{account_id}"
 
 
@@ -98,10 +122,7 @@ def run_claude_auth_status(account_id: int, tool: str = "claude") -> dict:
         return _codex_auth_status(account_dir(account_id, tool))
 
     env = os.environ.copy()
-    if account_id == 1:
-        env.pop("CLAUDE_CONFIG_DIR", None)
-    else:
-        env["CLAUDE_CONFIG_DIR"] = str(account_dir(account_id, tool))
+    env["CLAUDE_CONFIG_DIR"] = str(account_dir(account_id, tool))
 
     try:
         completed = subprocess.run(
@@ -230,6 +251,86 @@ def add_account(account_id: int, tool: str = "claude") -> None:
     env["CLAUDE_CONFIG_DIR"] = str(path)
     subprocess.run(["claude", "auth", "login"], env=env, check=True)
     mark_onboarding_complete(path)
+    share_claude_config(path)
+
+
+def _shared_config_source() -> Path:
+    """The user's own ~/.claude — read as the shared-config origin, never written."""
+    return Path.home() / ".claude"
+
+
+def _link_shared_entries(config_dir: Path, source_dir: Path) -> list[str]:
+    """Point each SHARED_CLAUDE_ENTRIES item in config_dir at source_dir.
+
+    Existing real files/dirs are moved into config_dir/.pre-shared-<ts>/
+    rather than deleted. Returns the names newly linked.
+    """
+    linked = []
+    backup_dir = None
+    for name in SHARED_CLAUDE_ENTRIES:
+        source = source_dir / name
+        target = config_dir / name
+        if not source.exists():
+            continue
+        if target.is_symlink() and target.resolve() == source.resolve():
+            continue
+        if target.is_symlink():
+            target.unlink()
+        elif target.exists():
+            if backup_dir is None:
+                backup_dir = config_dir / f".pre-shared-{datetime.now():%Y%m%d-%H%M%S}"
+                backup_dir.mkdir()
+            shutil.move(str(target), str(backup_dir / name))
+        target.symlink_to(source)
+        linked.append(name)
+    return linked
+
+
+def _sync_mcp_servers(config_dir: Path, source_config: Path) -> None:
+    """Copy user-scope mcpServers from source_config into config_dir/.claude.json.
+
+    User-scope MCP servers live inside .claude.json next to per-account
+    login state, so the file itself can't be shared. Servers from the
+    source win on name clashes; servers only this account has are kept.
+    """
+    try:
+        source_servers = json.loads(source_config.read_text()).get("mcpServers") or {}
+    except (OSError, json.JSONDecodeError):
+        return
+    config_path = config_dir / ".claude.json"
+    try:
+        config = json.loads(config_path.read_text())
+    except FileNotFoundError:
+        config = {}
+    merged = {**(config.get("mcpServers") or {}), **source_servers}
+    if config.get("mcpServers") == merged:
+        return
+    config["mcpServers"] = merged
+    _write_json_private(config_path, config)
+
+
+def share_claude_config(config_dir: Path) -> list[str]:
+    """Make a scheduler account use ~/.claude's skills/plugins/settings/MCP.
+
+    Never touches ~/.claude itself. Returns the entry names newly linked.
+    """
+    source_dir = _shared_config_source()
+    if config_dir.resolve() == source_dir.resolve():
+        return []
+    linked = _link_shared_entries(config_dir, source_dir)
+    _sync_mcp_servers(config_dir, Path.home() / ".claude.json")
+    return linked
+
+
+def share_claude_config_all() -> dict[int, list[str]]:
+    """share_claude_config for every added Claude account, user1 included."""
+    accounts_root = Path.home() / ".usage-reset-scheduler" / "accounts"
+    results = {}
+    for candidate in sorted(accounts_root.glob("claude-*")):
+        suffix = candidate.name.rsplit("-", 1)[-1]
+        if candidate.is_dir() and suffix.isdigit() and int(suffix) >= 1:
+            results[int(suffix)] = share_claude_config(candidate)
+    return results
 
 
 def mark_onboarding_complete(config_dir: Path) -> None:
@@ -248,10 +349,14 @@ def mark_onboarding_complete(config_dir: Path) -> None:
     if config.get("hasCompletedOnboarding") is True:
         return
     config["hasCompletedOnboarding"] = True
-    tmp_path = config_path.with_name(config_path.name + ".tmp")
-    tmp_path.write_text(json.dumps(config, indent=2))
+    _write_json_private(config_path, config)
+
+
+def _write_json_private(path: Path, data: dict) -> None:
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2))
     os.chmod(tmp_path, 0o600)
-    tmp_path.replace(config_path)
+    tmp_path.replace(path)
 
 
 def remove_account(account_id: int, tool: str = "claude") -> Path:
@@ -284,7 +389,7 @@ def list_accounts(get_tool=None) -> list[tuple[int, str, Path, str | None, str]]
         if not candidate.is_dir():
             continue
         suffix = candidate.name.rsplit("-", 1)[-1]
-        if suffix.isdigit() and int(suffix) >= 2:
+        if suffix.isdigit() and int(suffix) >= 1:
             account_ids.add(int(suffix))
 
     results = []

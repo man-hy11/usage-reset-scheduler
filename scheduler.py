@@ -416,6 +416,9 @@ def build_claude_command(model: str, effort: str, prompt: str) -> list[str]:
     return [
         "claude",
         "--dangerously-skip-permissions",
+        # 추가 계정은 ~/.claude의 MCP 설정을 공유하므로, 한도 리셋용 짧은
+        # 호출에서 MCP 서버들이 매번 기동되지 않도록 막는다.
+        "--strict-mcp-config",
         "--model", model,
         "--effort", effort,
         "-p",
@@ -497,10 +500,7 @@ def _run_and_log(account_id: int, tool: str, cmd: list[str], env: dict, extract_
 
 def run_claude(account_id: int, model: str, effort: str) -> bool:
     env = os.environ.copy()
-    if account_id == 1:
-        env.pop("CLAUDE_CONFIG_DIR", None)
-    else:
-        env["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(account_id))
+    env["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(account_id))
 
     cmd = build_claude_command(model, effort, PROMPT_TEXT)
     return _run_and_log(account_id, "claude", cmd, env, _extract_claude_text)
@@ -508,10 +508,7 @@ def run_claude(account_id: int, model: str, effort: str) -> bool:
 
 def run_codex(account_id: int, model: str, effort: str) -> bool:
     env = os.environ.copy()
-    if account_id == 1:
-        env.pop("CODEX_HOME", None)
-    else:
-        env["CODEX_HOME"] = str(accounts.account_dir(account_id, "codex"))
+    env["CODEX_HOME"] = str(accounts.account_dir(account_id, "codex"))
 
     cmd = build_codex_command(model, effort, PROMPT_TEXT)
     return _run_and_log(account_id, "codex", cmd, env, _extract_codex_text)
@@ -539,6 +536,16 @@ def prompt_for_tool(input_fn=input) -> str:
         if choice == "2":
             return "codex"
         print(f"알 수 없는 입력입니다: {choice!r} (1 또는 2를 입력하세요)")
+
+
+def _share_claude_config_all() -> None:
+    """Keep every added Claude account in sync with ~/.claude (best effort)."""
+    try:
+        for account_id, linked in accounts.share_claude_config_all().items():
+            if linked:
+                print(f"[account {account_id}] ~/.claude 설정 공유 연결: {', '.join(linked)}")
+    except OSError as exc:
+        print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] ~/.claude 설정 공유 실패: {exc!r}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -613,6 +620,8 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(str(exc), file=sys.stderr)
             return 1
+
+    _share_claude_config_all()
 
     existing_raw = load_queue(QUEUE_PATH)
     try:
