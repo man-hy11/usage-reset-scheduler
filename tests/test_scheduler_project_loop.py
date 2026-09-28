@@ -1,3 +1,6 @@
+import os
+import signal
+import sys
 import time
 
 import pytest
@@ -178,3 +181,36 @@ def test_existing_reset_mode_never_enters_project_loop(monkeypatch):
     monkeypatch.setattr(scheduler, "run_scheduler_loop", lambda *args, **kwargs: None)
     assert scheduler.main(["1"]) == 0
     assert entered == []
+
+
+def test_project_loop_makes_stdout_line_buffered(project, captured_loop, monkeypatch):
+    import io
+    stream = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert stream.line_buffering is False
+    scheduler.main(["--project-loop", "--project-dir", str(project)])
+    assert stream.line_buffering is True
+
+
+def test_sigterm_stops_loop_returns_130_restores_handler_and_releases_lock(project, monkeypatch, tmp_path):
+    def terminated(loop_accounts, **kwargs):
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(5)
+        raise AssertionError("SIGTERM did not interrupt the loop")
+
+    monkeypatch.setattr(project_loop, "run_project_loop", terminated)
+    before = signal.getsignal(signal.SIGTERM)
+    assert scheduler.main(["--project-loop", "--project-dir", str(project)]) == 130
+    assert signal.getsignal(signal.SIGTERM) is before
+    fd = project_loop.acquire_project_lock(project_loop.lock_path_for(project, tmp_path / "locks"))
+    project_loop.release_project_lock(fd)
+
+
+def test_ctrl_c_during_account_selection_returns_130_and_releases_lock(project, monkeypatch, tmp_path):
+    def interrupted(account_id, tool):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(scheduler, "_check_plan", interrupted)
+    assert scheduler.main(["--project-loop", "--project-dir", str(project)]) == 130
+    fd = project_loop.acquire_project_lock(project_loop.lock_path_for(project, tmp_path / "locks"))
+    project_loop.release_project_lock(fd)

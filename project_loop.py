@@ -14,6 +14,7 @@ RESET_GRACE_SEC = 60
 ACCOUNT_RECHECK_SEC = 60 * 60
 AMBIGUOUS_LIMIT_PERCENT = 95
 UNKNOWN_FAIL_LIMIT = 3
+MAX_SLEEP_SLICE_SEC = 60
 
 
 @dataclass
@@ -179,6 +180,7 @@ def run_project_loop(
 ) -> int:
     current: LoopAccount | None = None
     unknown_fail_streak = 0
+    last_wait_target = None
 
     while True:
         now = now_fn()
@@ -186,9 +188,13 @@ def run_project_loop(
             current = _pick_next(loop_accounts, now)
             if current is None:
                 soonest = min(loop_accounts, key=lambda account: (account.available_at, account.account_id))
-                print_fn(f"[{_fmt(now)}] 사용 가능한 계정 없음 → user{soonest.account_id} 재개 {_fmt(soonest.available_at)}까지 대기")
-                sleep_fn(soonest.available_at - now)
+                wait_target = (soonest.account_id, soonest.available_at)
+                if wait_target != last_wait_target:
+                    print_fn(f"[{_fmt(now)}] 사용 가능한 계정 없음 → user{soonest.account_id} 재개 {_fmt(soonest.available_at)}까지 대기")
+                    last_wait_target = wait_target
+                sleep_fn(min(soonest.available_at - now, MAX_SLEEP_SLICE_SEC))
                 continue
+            last_wait_target = None
 
         if current.status == "account_error":
             if check_plan_fn(current.account_id, current.tool) is None:
@@ -244,7 +250,11 @@ def run_project_loop(
 
         # STEP_STATUS도 신호도 없음: 사용률이 거의 다 찼으면 신호를 놓친 한도 초과로 본다.
         status = _safe_usage(fetch_usage_fn, current, print_fn)
-        block = usage_block(status, now, interval_min, min_percent=AMBIGUOUS_LIMIT_PERCENT) if status is not None else None
+        block = None
+        if status is not None:
+            block = usage_block(status, now, interval_min) or usage_block(
+                status, now, interval_min, min_percent=AMBIGUOUS_LIMIT_PERCENT
+            )
         if block is not None:
             unknown_fail_streak = 0
             _set_exhausted(current, *block, print_fn)
@@ -259,3 +269,6 @@ def run_project_loop(
         if unknown_fail_streak >= UNKNOWN_FAIL_LIMIT:
             print_fn("알 수 없는 실패가 연속되어 안전하게 중단합니다.")
             return 1
+
+        print_fn(f"{interval_min}분 뒤 같은 계정으로 다시 시도합니다.")
+        sleep_fn(interval_min * 60)

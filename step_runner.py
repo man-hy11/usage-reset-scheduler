@@ -18,7 +18,7 @@ _STEP_STATUS_RE = re.compile(
     re.MULTILINE,
 )
 _CLAUDE_ACCOUNT_ERRORS = ("authentication_failed", "oauth_org_not_allowed")
-_CODEX_AUTH_MARKERS = ("sign in again", "log out")
+_CODEX_AUTH_MARKERS = ("sign in again",)
 
 
 @dataclass
@@ -51,6 +51,7 @@ class ClaudeEventReader:
         self.limit_hit = False
         self.limit_reset_at: int | None = None
         self.account_error: str | None = None
+        self._emitted_text = False
 
     def feed(self, line: str) -> str:
         event = _load_event(line)
@@ -59,9 +60,19 @@ class ClaudeEventReader:
         kind = event.get("type")
         if kind == "stream_event":
             inner = event.get("event")
-            delta = inner.get("delta") if isinstance(inner, dict) else None
+            if not isinstance(inner, dict):
+                return ""
+            if inner.get("type") == "content_block_start":
+                content_block = inner.get("content_block")
+                if isinstance(content_block, dict) and content_block.get("type") == "text":
+                    return "\n" if self._emitted_text else ""
+                return ""
+            delta = inner.get("delta")
             if isinstance(delta, dict) and delta.get("type") == "text_delta":
-                return str(delta.get("text", ""))
+                text = str(delta.get("text", ""))
+                if text:
+                    self._emitted_text = True
+                return text
         elif kind == "rate_limit_event":
             # 정상 실행에도 status가 "allowed"/"allowed_warning"인 이벤트가 오므로 rejected만 본다.
             info = event.get("rate_limit_info")

@@ -256,8 +256,9 @@ def test_waits_for_soonest_reset_when_every_account_is_exhausted():
     h.run()
     assert h.ran == [1, 2, 2]
     # 1번 실행 → +600, 2번 실행 → +1200. 가장 빠른 재투입은 2번 계정의 NOW+2060.
-    assert h.sleeps == [NOW + 2060 - (NOW + 2 * RUN_SECONDS)]
-    assert any("사용 가능한 계정 없음" in line for line in h.output)
+    assert sum(h.sleeps) == 860
+    assert max(h.sleeps) <= project_loop.MAX_SLEEP_SLICE_SEC
+    assert sum("사용 가능한 계정 없음" in line for line in h.output) == 1
 
 
 def test_unknown_failures_retry_same_account_and_stop_after_three_in_a_row():
@@ -265,6 +266,7 @@ def test_unknown_failures_retry_same_account_and_stop_after_three_in_a_row():
     assert h.run() == 1
     assert h.ran == [1, 1, 1, 1, 1, 1]
     assert any("알 수 없는 실패" in line for line in h.output)
+    assert h.sleeps == [300, 300, 300, 300]
 
 
 def test_missing_status_with_high_usage_is_treated_as_exhausted():
@@ -317,3 +319,14 @@ def test_usage_errors_before_run_do_not_block_running():
     h = Harness([1], [ok("INCOMPLETE")], usages={1: RuntimeError("usage api down")})
     assert h.run() == 1
     assert h.ran == [1]
+
+
+def test_ambiguous_failure_prefers_the_window_that_is_actually_full():
+    h = Harness(
+        [1, 2],
+        [unknown()],
+        usages={1: sequence(usage(), usage(five=100, five_reset=NOW + 5000, week=96, week_reset=NOW + 90_000))},
+    )
+    h.run()
+    assert h.account(1).available_at == NOW + 5060
+    assert h.account(1).reason == "5시간 한도"

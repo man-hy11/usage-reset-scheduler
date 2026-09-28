@@ -7,6 +7,7 @@ import heapq
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time as _time
@@ -854,6 +855,11 @@ def _run_project_loop_mode(args, get_tool, management_flags: bool) -> int:
     if error:
         print(error, file=sys.stderr)
         return 1
+
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(line_buffering=True)
+
     project_dir = Path(args.project_dir).expanduser().resolve()
     prompt_path = project_dir / (args.prompt_file or "prompt.md")
 
@@ -877,6 +883,10 @@ def _run_project_loop_mode(args, get_tool, management_flags: bool) -> int:
         )
         return 1
 
+    def _stop_on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+
+    previous_sigterm = signal.signal(signal.SIGTERM, _stop_on_sigterm)
     try:
         if args.count is not None:
             account_ids, plans = select_paid_account_ids(args.count, get_tool, list(accounts.known_account_ids()))
@@ -906,20 +916,20 @@ def _run_project_loop_mode(args, get_tool, management_flags: bool) -> int:
             prompt_text = prompt_path.read_text(encoding="utf-8")
             return step_runner.run_step(account.account_id, account.tool, project_dir, prompt_text, model, effort)
 
-        try:
-            return project_loop.run_project_loop(
-                loop_accounts,
-                run_step_fn=run_step_fn,
-                fetch_usage_fn=fetch_usage,
-                check_plan_fn=_check_plan,
-                sleep_fn=_time.sleep,
-                now_fn=lambda: int(_time.time()),
-                interval_min=args.interval,
-            )
-        except KeyboardInterrupt:
-            print("\n작업 루프를 중단했습니다 (Ctrl+C).")
-            return 130
+        return project_loop.run_project_loop(
+            loop_accounts,
+            run_step_fn=run_step_fn,
+            fetch_usage_fn=fetch_usage,
+            check_plan_fn=_check_plan,
+            sleep_fn=_time.sleep,
+            now_fn=lambda: int(_time.time()),
+            interval_min=args.interval,
+        )
+    except KeyboardInterrupt:
+        print("\n작업 루프를 중단했습니다 (Ctrl+C 또는 종료 신호).")
+        return 130
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         project_loop.release_project_lock(lock_fd)
 
 

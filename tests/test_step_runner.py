@@ -1,8 +1,11 @@
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 import step_runner
 
@@ -111,6 +114,12 @@ def test_codex_reader_detects_auth_errors():
     assert reader.limit_hit is False
 
 
+def test_codex_auth_marker_ignores_unrelated_text():
+    reader = step_runner.CodexEventReader()
+    reader.feed(json.dumps({"type": "error", "message": "failed to write catalog output"}))
+    assert reader.account_error is None
+
+
 def test_codex_reader_ignores_non_limit_item_errors():
     reader = step_runner.CodexEventReader()
     reader.feed(json.dumps({"type": "item.completed", "item": {"type": "error", "message": "Model metadata not found"}}))
@@ -208,3 +217,37 @@ def test_stop_process_terminates_running_child():
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     step_runner.stop_process(proc, grace_sec=5)
     assert proc.poll() is not None
+
+
+def _block_start():
+    return json.dumps({"type": "stream_event", "event": {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}})
+
+
+def test_claude_text_blocks_are_newline_separated():
+    reader = step_runner.ClaudeEventReader()
+    text = _feed_all(reader, [_block_start(), _delta("Working on it."), _block_start(), _delta("STEP_STATUS: COMPLETE")])
+    assert text == "Working on it.\nSTEP_STATUS: COMPLETE"
+    assert step_runner.find_step_status(text) == "COMPLETE"
+
+
+def test_run_step_stops_child_when_interrupted(monkeypatch, tmp_path):
+    script = (
+        "import json, os, sys, time\n"
+        "print(json.dumps({'type': 'stream_event', 'event': {'delta': {'type': 'text_delta', 'text': str(os.getpid())}}}), flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(step_runner, "build_command", lambda *args, **kwargs: [sys.executable, "-c", script])
+    seen = {}
+
+    class InterruptingOut:
+        def write(self, text):
+            seen["pid"] = int(text)
+            raise KeyboardInterrupt
+
+        def flush(self):
+            pass
+
+    with pytest.raises(KeyboardInterrupt):
+        step_runner.run_step(1, "claude", tmp_path, "PROMPT", "m", "e", out=InterruptingOut())
+    with pytest.raises(ProcessLookupError):
+        os.kill(seen["pid"], 0)
