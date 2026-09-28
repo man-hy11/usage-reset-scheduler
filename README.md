@@ -30,6 +30,10 @@ python3 scheduler.py --count 6   # 또는: python3 scheduler.py -n 6
 # 특정 시각에 최초 실행 시작
 python3 scheduler.py 1 -w "14:00"
 python3 scheduler.py 1 -w "2026-10-01 09:00"
+
+# 작업 루프: 유료 계정 4개를 번갈아 쓰며 ~/shortform-ai의 prompt.md를 계속 실행
+# (한도가 찬 계정은 리셋 시각까지 쉬고, 쓸 수 있는 다음 계정이 같은 step을 이어받음)
+python3 scheduler.py --project-loop --project-dir ~/shortform-ai -n 4
 ```
 
 ## 동작 방식 (요약)
@@ -131,6 +135,33 @@ python3 scheduler.py 1 2 4 --check-subscription   # 또는: python3 scheduler.py
 
 무료/미로그인 계정(`SKIP`)은 한도 조회를 건너뜁니다. 유료 구독이 확인됐지만 한도 API 조회 자체가 실패하면(`사용량 조회 실패: ...`) 그 줄만 건너뛰고 다음 계정으로 진행합니다.
 
+## 작업 루프 (`--project-loop`)
+
+리셋용 "OK" 호출 대신, 대상 프로젝트의 프롬프트(`prompt.md`)를 실제로 실행하는 모드입니다. `~/shortform-ai`의 `run-step-loop-claude.sh`/`run-step-loop.sh`를 여러 계정으로 이어서 돌리는 것과 같습니다.
+
+```bash
+python3 scheduler.py --project-loop --project-dir ~/shortform-ai -n 4
+python3 scheduler.py --project-loop --project-dir ~/shortform-ai 2 3 4 --prompt-file prompt.md
+```
+
+동작:
+- 한 계정으로 계속 실행합니다. 출력의 `STEP_STATUS: COMPLETE` / `FAILURE_ANALYSIS` / `FAILURE_IMPROVEMENT`를 보면 같은 계정으로 다음 실행을 이어갑니다.
+- 한도에 걸리면(claude: `rate_limit_event` rejected / 429, codex: `turn.failed`의 "usage limit") 그 계정을 리셋 시각 + 1분까지 쉬게 하고, 쓸 수 있는 다음 계정이 **같은 step을 처음부터** 다시 실행합니다. 진행 상태는 `PHASE.md`, worklog, 작업 트리에 남아 있습니다.
+- 계정을 쓰기 직전마다 사용량을 다시 조회해, 그 사이 한도가 찬 계정은 건너뜁니다.
+- 쓸 수 있는 계정이 없으면 가장 빠른 리셋 시각까지 기다렸다가 재개합니다.
+- 로그인 만료 같은 계정 오류는 그 계정만 빼 두고 60분마다 다시 확인합니다.
+- 종료: `STEP_STATUS: INCOMPLETE`(권한/승인 문제라 계정을 바꿔도 해결되지 않음), 완료 상태도 한도 신호도 없는 실패가 3회 연속, 또는 `Ctrl+C`(종료 코드 130).
+
+모델: `--model`/`--effort`는 **claude 계정에만** 적용되며, 이 모드의 기본값은 `claude-opus-5-5` / `high`입니다. codex 계정은 codex CLI 기본 설정으로 실행합니다.
+
+로그: `<프로젝트>/.claude-runs/` 또는 `.codex-runs/`에 `step-<타임스탬프>-user<N>.log`(텍스트, 기존 스크립트 로그와 같은 형식)와 `step-<타임스탬프>-user<N>.raw.jsonl`(CLI 원본 출력)이 남습니다.
+
+동시 실행:
+- 같은 프로젝트에 작업 루프를 두 번 띄우면 두 번째는 시작하지 않습니다(프로젝트별 잠금, `.schedule/locks/`). 다른 프로젝트끼리는 동시에 돌릴 수 있습니다.
+- 리셋 스케줄러(`python3 scheduler.py -n 4`)와 작업 루프는 동시에 돌려도 됩니다. claude는 토큰 갱신을 CLI가 잠금으로 순서를 맞추고, codex는 인증 실패 시 `auth.json`을 다시 읽습니다. codex에서 드물게 "refresh token was already used"가 나면 `-a N`으로 다시 로그인하세요.
+- 작업 루프가 도는 동안 **같은 프로젝트에서 기존 `run-step-loop*.sh`를 돌리거나 직접 편집하지 마세요.** 이 잠금으로는 막지 못합니다.
+- 작업 루프는 `.schedule/queue.json`을 읽거나 쓰지 않으므로, 리셋 스케줄러의 "최근 실행"에는 작업 루프의 실행이 표시되지 않습니다.
+
 ## 전체 옵션
 
 ```
@@ -150,6 +181,9 @@ python3 scheduler.py [계정번호 ...] [옵션]
 | `--list-accounts` | `-l` | — | 등록 계정, 도구, 구독 상태 표시 |
 | `--remove-account N` | `-r` | — | `userN`을 백업 이름으로 이동 (복구 가능, `user1`은 불가) |
 | `--count N` | `-n` | — | 계정 번호 나열 대신, 존재하는 모든 계정(account 1 포함, `--list-accounts`와 동일한 기준)을 1번부터 순서대로 실시간 확인해 유료 구독 계정만 최대 N개 자동 선택. 계정이 N개보다 적으면 있는 만큼만 선택. 명시적 계정번호나 다른 계정 관리 옵션(`-a`/`-l`/`-r`/`-c`)과 함께 쓸 수 없음 |
+| `--project-loop` | — | — | 작업 루프 모드. 여러 계정을 번갈아 쓰며 `--project-dir`의 프롬프트를 반복 실행 (위 "작업 루프" 참고). `-a`/`-l`/`-r`/`-c`와 함께 쓸 수 없음 |
+| `--project-dir DIR` | — | — | `--project-loop` 대상 프로젝트. git 저장소여야 함 |
+| `--prompt-file FILE` | — | `prompt.md` | `--project-dir` 기준 프롬프트 파일. 매 실행마다 새로 읽음 |
 
 계정 번호를 여러 개 지정하면 중복은 제거되고 처음 등장한 순서가 유지됩니다. `--model`/`--effort`를 명시하면 그 실행에 포함된 **모든** 계정(도구 무관)에 동일하게 적용됩니다 — claude와 codex를 같은 실행에 섞을 때 서로 다른 모델을 강제로 맞추고 싶은 게 아니라면 보통 생략하는 편이 안전합니다.
 
@@ -158,3 +192,5 @@ python3 scheduler.py [계정번호 ...] [옵션]
 - 실행 로그: `<계정 설정 디렉터리>/start-limit-runs/loop-<타임스탬프>.log`
 - 스케줄 상태: `<프로젝트 루트>/.schedule/queue.json` (git 추적 대상 아님)
 - 계정 ↔ 도구 매핑: `<프로젝트 루트>/.schedule/accounts.json` (git 추적 대상 아님)
+- 작업 루프 로그: `<대상 프로젝트>/.claude-runs/` 또는 `.codex-runs/`의 `step-<타임스탬프>-user<N>.log` / `.raw.jsonl`
+- 작업 루프 잠금: `<프로젝트 루트>/.schedule/locks/project-<해시>.lock` (git 추적 대상 아님)
