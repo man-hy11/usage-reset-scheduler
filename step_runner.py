@@ -173,7 +173,7 @@ def run_step(
     text_parts: list[str] = []
 
     with open(raw_path, "w", encoding="utf-8") as raw_file, open(log_path, "w", encoding="utf-8") as log_file:
-        proc = subprocess.Popen(
+        with subprocess.Popen(
             build_command(tool, project_dir, prompt_text, model, effort),
             cwd=project_dir,
             env=build_env(account_id, tool),
@@ -183,21 +183,21 @@ def run_step(
             text=True,
             encoding="utf-8",
             errors="replace",
-        )
-        try:
-            for line in proc.stdout:
-                raw_file.write(line)
-                text = reader.feed(line)
-                if text:
-                    text_parts.append(text)
-                    log_file.write(text)
-                    log_file.flush()
-                    out.write(text)
-                    out.flush()
-            exit_code = proc.wait()
-        except BaseException:
-            stop_process(proc)
-            raise
+        ) as proc:
+            try:
+                for line in proc.stdout:
+                    raw_file.write(line)
+                    text = reader.feed(line)
+                    if text:
+                        text_parts.append(text)
+                        log_file.write(text)
+                        log_file.flush()
+                        out.write(text)
+                        out.flush()
+                exit_code = proc.wait()
+            except BaseException:
+                stop_process(proc)
+                raise
 
     out.write("\n")
     out.flush()
