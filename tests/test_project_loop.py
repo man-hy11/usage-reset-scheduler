@@ -1,3 +1,5 @@
+import pytest
+
 import project_loop
 from project_loop import LoopAccount
 
@@ -77,3 +79,46 @@ def test_format_status_lists_current_first_then_others():
     assert "user3 [claude" in lines[2] and "대기" in lines[2]
     assert "user4 [codex" in lines[3] and "계정 오류(codex_auth)" in lines[3]
     assert "user1 [claude" in lines[4] and "소진(주간 한도)" in lines[4]
+
+
+def test_lock_blocks_second_holder_and_reports_first_holder_info(tmp_path):
+    path = project_loop.lock_path_for(tmp_path / "proj", tmp_path / "locks")
+    fd = project_loop.acquire_project_lock(path)
+    project_loop.write_lock_info(fd, "PID 123, 시작 2026-09-28 12:00:00, 계정 user2")
+    try:
+        with pytest.raises(project_loop.ProjectLockError) as exc_info:
+            project_loop.acquire_project_lock(path)
+        assert "PID 123" in str(exc_info.value)
+    finally:
+        project_loop.release_project_lock(fd)
+
+    fd_again = project_loop.acquire_project_lock(path)
+    project_loop.release_project_lock(fd_again)
+
+
+def test_lock_info_is_replaced_not_appended(tmp_path):
+    path = project_loop.lock_path_for(tmp_path / "proj", tmp_path / "locks")
+    fd = project_loop.acquire_project_lock(path)
+    project_loop.write_lock_info(fd, "a much longer first line of lock info")
+    project_loop.write_lock_info(fd, "short")
+    project_loop.release_project_lock(fd)
+    assert path.read_text() == "short"
+
+
+def test_lock_path_is_same_for_symlinked_and_relative_paths(tmp_path, monkeypatch):
+    real = tmp_path / "proj"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    monkeypatch.chdir(tmp_path)
+    locks = tmp_path / "locks"
+    assert project_loop.lock_path_for(link, locks) == project_loop.lock_path_for(real, locks)
+    assert project_loop.lock_path_for(project_loop.Path("proj"), locks) == project_loop.lock_path_for(real, locks)
+
+
+def test_lock_on_different_projects_is_independent(tmp_path):
+    locks = tmp_path / "locks"
+    fd_a = project_loop.acquire_project_lock(project_loop.lock_path_for(tmp_path / "a", locks))
+    fd_b = project_loop.acquire_project_lock(project_loop.lock_path_for(tmp_path / "b", locks))
+    project_loop.release_project_lock(fd_a)
+    project_loop.release_project_lock(fd_b)

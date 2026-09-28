@@ -1,8 +1,12 @@
 """Rotate accounts through a project's prompt loop, switching accounts on usage limits."""
 from __future__ import annotations
 
+import fcntl
+import hashlib
+import os
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 from step_runner import CONTINUE_STATUSES, StepOutcome
 
@@ -96,3 +100,34 @@ def format_status(loop_accounts: list[LoopAccount], current: LoopAccount, now: i
             lines.append(f"  {tag}  대기")
     lines.append("===================================")
     return "\n".join(lines)
+
+
+class ProjectLockError(Exception):
+    """이미 다른 작업 루프가 같은 프로젝트를 잠그고 있다. str()은 그쪽이 기록한 정보."""
+
+
+def lock_path_for(project_dir: Path, lock_root: Path) -> Path:
+    digest = hashlib.sha1(str(Path(project_dir).resolve()).encode("utf-8")).hexdigest()[:12]
+    return lock_root / f"project-{digest}.lock"
+
+
+def acquire_project_lock(lock_path: Path) -> int:
+    # flock은 프로세스가 어떻게 끝나든(kill -9 포함) OS가 풀어 주므로 남은 잠금 파일을 지울 필요가 없다.
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        holder = os.pread(fd, 4096, 0).decode("utf-8", errors="replace").strip()
+        os.close(fd)
+        raise ProjectLockError(holder or "(실행 정보 없음)") from None
+    return fd
+
+
+def write_lock_info(fd: int, info: str) -> None:
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, info.encode("utf-8"), 0)
+
+
+def release_project_lock(fd: int) -> None:
+    os.close(fd)
