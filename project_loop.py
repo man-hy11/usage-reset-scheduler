@@ -107,7 +107,7 @@ class ProjectLockError(Exception):
 
 
 def lock_path_for(project_dir: Path, lock_root: Path) -> Path:
-    digest = hashlib.sha1(str(Path(project_dir).resolve()).encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha1(str(Path(project_dir).expanduser().resolve()).encode("utf-8")).hexdigest()[:12]
     return lock_root / f"project-{digest}.lock"
 
 
@@ -121,6 +121,7 @@ def acquire_project_lock(lock_path: Path) -> int:
         holder = os.pread(fd, 4096, 0).decode("utf-8", errors="replace").strip()
         os.close(fd)
         raise ProjectLockError(holder or "(실행 정보 없음)") from None
+    os.ftruncate(fd, 0)
     return fd
 
 

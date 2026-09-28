@@ -122,3 +122,26 @@ def test_lock_on_different_projects_is_independent(tmp_path):
     fd_b = project_loop.acquire_project_lock(project_loop.lock_path_for(tmp_path / "b", locks))
     project_loop.release_project_lock(fd_a)
     project_loop.release_project_lock(fd_b)
+
+
+def test_lock_path_expands_tilde(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    locks = tmp_path / "locks"
+    home_path = project_loop.lock_path_for(project_loop.Path("~") / "something", locks)
+    absolute_path = project_loop.lock_path_for(project_loop.Path.home() / "something", locks)
+    assert home_path == absolute_path
+
+
+def test_acquire_clears_stale_lock_info(tmp_path):
+    path = project_loop.lock_path_for(tmp_path / "proj", tmp_path / "locks")
+    fd = project_loop.acquire_project_lock(path)
+    project_loop.write_lock_info(fd, "old")
+    project_loop.release_project_lock(fd)
+
+    fd2 = project_loop.acquire_project_lock(path)
+    try:
+        with pytest.raises(project_loop.ProjectLockError) as exc_info:
+            project_loop.acquire_project_lock(path)
+        assert str(exc_info.value) == "(실행 정보 없음)"
+    finally:
+        project_loop.release_project_lock(fd2)
