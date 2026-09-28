@@ -1,0 +1,3 @@
+{"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", "resetsAt": 1790787600, "rateLimitType": "seven_day", "overageStatus": "rejected", "overageDisabledReason": "org_level_disabled", "isUsingOverage": false}}
+{"type": "assistant", "error": "rate_limit", "message": {"role": "assistant", "content": [{"type": "text", "text": "You’ve hit your weekly limit · resets Oct 1, 2am (Asia/Seoul)"}]}}
+{"type": "result", "subtype": "success", "is_error": true, "api_error_status": 429, "terminal_reason": "api_error", "result": "You’ve hit your weekly limit · resets Oct 1, 2am (Asia/Seoul)"}
