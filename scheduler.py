@@ -489,6 +489,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="계정 번호를 나열하는 대신, 등록된 계정 중 유료 구독인 계정을 1번부터 순서대로 최대 N개 자동 선택합니다. "
              "명시적 account_ids와 함께 쓸 수 없습니다.",
     )
+    parser.add_argument("--project-loop", action="store_true", default=False,
+                        help="여러 계정을 번갈아 쓰며 --project-dir의 프롬프트를 반복 실행합니다.")
+    parser.add_argument("--project-dir", default=None, help="--project-loop 대상 프로젝트 (git 저장소)")
+    parser.add_argument("--prompt-file", default=None, help="--project-dir 기준 프롬프트 파일. 기본값: prompt.md")
 
     args = parser.parse_args(argv)
 
@@ -696,6 +700,8 @@ def main(argv: list[str] | None = None) -> int:
         or args.remove_account is not None
         or args.check_subscription
     )
+    if args.project_loop or args.project_dir is not None or args.prompt_file is not None:
+        return _run_project_loop_mode(args, get_tool, management_flags)
     if args.count is not None and management_flags:
         print(
             "--count/-n은 --add-account/--list-accounts/--remove-account/"
@@ -811,6 +817,110 @@ def main(argv: list[str] | None = None) -> int:
         queue_path=QUEUE_PATH,
     )
     return 0
+
+
+PROJECT_LOCK_ROOT = Path(__file__).parent / ".schedule" / "locks"
+PROJECT_LOOP_DEFAULT_MODEL = "claude-opus-5-5"
+PROJECT_LOOP_DEFAULT_EFFORT = "high"
+
+
+def _project_loop_arg_error(args, management_flags: bool) -> str | None:
+    if not args.project_loop:
+        return "--project-dir/--prompt-file은 --project-loop와 함께만 쓸 수 있습니다."
+    if management_flags:
+        return "--project-loop는 --add-account/--list-accounts/--remove-account/--check-subscription과 함께 쓸 수 없습니다."
+    if args.project_dir is None:
+        return "--project-loop에는 --project-dir이 필요합니다."
+    if args.delay < 0:
+        return f"--delay는 음수일 수 없습니다 (delay={args.delay})"
+    if args.interval < 1:
+        return f"--project-loop의 --interval은 1 이상이어야 합니다 (interval={args.interval})"
+    project_dir = Path(args.project_dir).expanduser()
+    if not project_dir.is_dir():
+        return f"프로젝트 디렉터리가 없습니다: {project_dir}"
+    if not (project_dir / ".git").exists():
+        return f"Git 저장소가 아닙니다: {project_dir}"
+    prompt_path = project_dir / (args.prompt_file or "prompt.md")
+    if not prompt_path.is_file():
+        return f"프롬프트 파일을 찾을 수 없습니다: {prompt_path}"
+    return None
+
+
+def _run_project_loop_mode(args, get_tool, management_flags: bool) -> int:
+    import project_loop
+    import step_runner
+
+    error = _project_loop_arg_error(args, management_flags)
+    if error:
+        print(error, file=sys.stderr)
+        return 1
+    project_dir = Path(args.project_dir).expanduser().resolve()
+    prompt_path = project_dir / (args.prompt_file or "prompt.md")
+
+    now = int(_time.time())
+    start_at = now
+    if args.wait_until:
+        try:
+            start_at = _parse_wait_until(args.wait_until, now)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    start_at += args.delay * 60
+
+    try:
+        lock_fd = project_loop.acquire_project_lock(project_loop.lock_path_for(project_dir, PROJECT_LOCK_ROOT))
+    except project_loop.ProjectLockError as exc:
+        print(
+            f"이미 이 프로젝트에서 작업 루프가 실행 중입니다: {project_dir}\n  {exc}\n"
+            "중복 실행하면 두 에이전트가 PHASE.md와 git을 동시에 수정하므로 시작하지 않습니다.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        if args.count is not None:
+            account_ids, plans = select_paid_account_ids(args.count, get_tool, list(accounts.known_account_ids()))
+        else:
+            account_ids = args.account_ids
+            plans = {account_id: _check_plan(account_id, get_tool(account_id)) for account_id in account_ids}
+        if not any(plans.get(account_id) for account_id in account_ids):
+            print("--project-loop: 유료 구독인 계정이 없습니다.", file=sys.stderr)
+            return 1
+
+        project_loop.write_lock_info(
+            lock_fd,
+            f"PID {os.getpid()}, 시작 {datetime.now():%Y-%m-%d %H:%M:%S}, 계정 "
+            + ", ".join(f"user{account_id}" for account_id in account_ids),
+        )
+        _share_claude_config_all()
+
+        loop_accounts = project_loop.build_loop_accounts(
+            account_ids, get_tool, plans, fetch_usage,
+            start_at=start_at, now=int(_time.time()), interval_min=args.interval,
+        )
+        model = args.model or PROJECT_LOOP_DEFAULT_MODEL
+        effort = args.effort or PROJECT_LOOP_DEFAULT_EFFORT
+
+        def run_step_fn(account):
+            # 루프 도중 프롬프트를 고치면 다음 실행부터 반영되도록 매번 읽는다.
+            prompt_text = prompt_path.read_text(encoding="utf-8")
+            return step_runner.run_step(account.account_id, account.tool, project_dir, prompt_text, model, effort)
+
+        try:
+            return project_loop.run_project_loop(
+                loop_accounts,
+                run_step_fn=run_step_fn,
+                fetch_usage_fn=fetch_usage,
+                check_plan_fn=_check_plan,
+                sleep_fn=_time.sleep,
+                now_fn=lambda: int(_time.time()),
+                interval_min=args.interval,
+            )
+        except KeyboardInterrupt:
+            print("\n작업 루프를 중단했습니다 (Ctrl+C).")
+            return 130
+    finally:
+        project_loop.release_project_lock(lock_fd)
 
 
 def _parse_wait_until(text: str, now: int) -> int:
