@@ -139,6 +139,8 @@ python3 scheduler.py 1 2 4 --check-subscription   # 또는: python3 scheduler.py
 
 리셋용 "OK" 호출 대신, 대상 프로젝트의 프롬프트(`prompt.md`)를 실제로 실행하는 모드입니다. `~/shortform-ai`의 `run-step-loop-claude.sh`/`run-step-loop.sh`를 여러 계정으로 이어서 돌리는 것과 같습니다.
 
+> **실험적 기능입니다.** 재로그인이 필요한 계정, 리셋 시각을 알 수 없는 codex 한도 등 일부 오류 상황에서 종료하지 않고 같은 실행을 반복할 수 있습니다. 며칠 동안 지켜보지 않고 돌릴 때는 로그를 가끔 확인하세요. 알려진 문제와 수정 계획은 [`docs/worklog/project-loop-review-followups.md`](docs/worklog/project-loop-review-followups.md)에 있습니다.
+
 ```bash
 python3 scheduler.py --project-loop --project-dir ~/shortform-ai -n 4
 python3 scheduler.py --project-loop --project-dir ~/shortform-ai 2 3 4 --prompt-file prompt.md
