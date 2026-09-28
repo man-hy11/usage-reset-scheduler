@@ -1,4 +1,7 @@
 import json
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import step_runner
@@ -113,3 +116,95 @@ def test_codex_reader_ignores_non_limit_item_errors():
     reader.feed(json.dumps({"type": "item.completed", "item": {"type": "error", "message": "Model metadata not found"}}))
     assert reader.limit_hit is False
     assert reader.account_error is None
+
+
+def _fake_cli(monkeypatch, lines, exit_code=0):
+    script = (
+        "import sys\n"
+        f"lines = {lines!r}\n"
+        "for line in lines:\n"
+        "    print(line, flush=True)\n"
+        f"sys.exit({exit_code})\n"
+    )
+    monkeypatch.setattr(step_runner, "build_command", lambda *args, **kwargs: [sys.executable, "-c", script])
+
+
+def _raw_path(log_path):
+    return log_path.parent / (log_path.stem + ".raw.jsonl")
+
+
+def test_build_command_claude_uses_model_effort_and_no_strict_mcp(tmp_path):
+    cmd = step_runner.build_command("claude", tmp_path, "PROMPT", "claude-opus-5-5", "high")
+    assert cmd[0] == "claude"
+    assert cmd[cmd.index("--model") + 1] == "claude-opus-5-5"
+    assert cmd[cmd.index("--effort") + 1] == "high"
+    assert "--strict-mcp-config" not in cmd
+    assert cmd[-1] == "PROMPT"
+    assert "stream-json" in cmd
+
+
+def test_build_command_codex_ignores_model_and_sets_project_dir(tmp_path):
+    cmd = step_runner.build_command("codex", tmp_path, "PROMPT", "claude-opus-5-5", "high")
+    assert cmd[:3] == ["codex", "exec", "--json"]
+    assert cmd[cmd.index("-C") + 1] == str(tmp_path)
+    assert "--model" not in cmd
+    assert "claude-opus-5-5" not in cmd
+    assert cmd[-1] == "PROMPT"
+
+
+def test_build_env_points_tool_at_account_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(step_runner.accounts.Path, "home", lambda: tmp_path)
+    claude_env = step_runner.build_env(3, "claude")
+    codex_env = step_runner.build_env(4, "codex")
+    assert claude_env["CLAUDE_CONFIG_DIR"] == str(tmp_path / ".usage-reset-scheduler" / "accounts" / "claude-3")
+    assert codex_env["CODEX_HOME"] == str(tmp_path / ".usage-reset-scheduler" / "accounts" / "codex-4")
+
+
+def test_run_step_streams_text_writes_logs_and_parses_status(monkeypatch, tmp_path, capsys):
+    _fake_cli(monkeypatch, [_delta("working...\n"), "not json", _delta("STEP_STATUS: COMPLETE\n")])
+    outcome = step_runner.run_step(2, "claude", tmp_path, "PROMPT", "m", "e")
+
+    assert outcome.step_status == "COMPLETE"
+    assert outcome.exit_code == 0
+    assert outcome.limit_hit is False
+    assert outcome.log_path.parent == tmp_path / ".claude-runs"
+    assert re.fullmatch(r"step-\d{8}-\d{6}-user2\.log", outcome.log_path.name)
+    assert outcome.log_path.read_text() == "working...\nSTEP_STATUS: COMPLETE\n"
+    assert "not json" in _raw_path(outcome.log_path).read_text()
+    assert "working..." in capsys.readouterr().out
+
+
+def test_run_step_detects_claude_limit(monkeypatch, tmp_path):
+    _fake_cli(monkeypatch, (FIXTURES / "claude_limit.jsonl").read_text().splitlines(), exit_code=1)
+    outcome = step_runner.run_step(1, "claude", tmp_path, "PROMPT", "m", "e")
+    assert outcome.step_status is None
+    assert outcome.limit_hit is True
+    assert outcome.limit_reset_at == 1790787600
+    assert outcome.exit_code == 1
+
+
+def test_run_step_codex_logs_to_codex_runs_and_detects_limit(monkeypatch, tmp_path):
+    _fake_cli(monkeypatch, (FIXTURES / "codex_limit.jsonl").read_text(encoding="utf-8").splitlines(), exit_code=1)
+    outcome = step_runner.run_step(4, "codex", tmp_path, "PROMPT", "m", "e")
+    assert outcome.log_path.parent == tmp_path / ".codex-runs"
+    assert outcome.limit_hit is True
+    assert outcome.exit_code == 1
+
+
+def test_run_step_connects_stdin_to_devnull(monkeypatch, tmp_path):
+    # stdin이 DEVNULL이면 select가 즉시 읽을 수 있다고 알리고 read()는 ''를 돌려준다.
+    script = (
+        "import json, select, sys\n"
+        "ready = select.select([sys.stdin], [], [], 0.5)[0]\n"
+        "data = sys.stdin.read() if ready else 'BLOCKED'\n"
+        "print(json.dumps({'type': 'stream_event', 'event': {'delta': {'type': 'text_delta', 'text': 'stdin=' + repr(data)}}}), flush=True)\n"
+    )
+    monkeypatch.setattr(step_runner, "build_command", lambda *args, **kwargs: [sys.executable, "-c", script])
+    outcome = step_runner.run_step(1, "claude", tmp_path, "PROMPT", "m", "e")
+    assert outcome.log_path.read_text() == "stdin=''"
+
+
+def test_stop_process_terminates_running_child():
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    step_runner.stop_process(proc, grace_sec=5)
+    assert proc.poll() is not None

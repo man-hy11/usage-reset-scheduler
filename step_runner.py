@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+
+import accounts
 
 CONTINUE_STATUSES = ("COMPLETE", "FAILURE_ANALYSIS", "FAILURE_IMPROVEMENT")
 _STEP_STATUS_RE = re.compile(
@@ -108,3 +114,98 @@ class CodexEventReader:
             elif any(marker in lowered for marker in _CODEX_AUTH_MARKERS):
                 self.account_error = "codex_auth"
         return ""
+
+
+def build_command(tool: str, project_dir: Path, prompt_text: str, model: str, effort: str) -> list[str]:
+    if tool == "codex":
+        # codex는 CLI 기본 모델/effort를 쓴다(run-step-loop.sh와 동일).
+        return ["codex", "exec", "--json", "--sandbox", "danger-full-access", "-C", str(project_dir), prompt_text]
+    return [
+        "claude", "--dangerously-skip-permissions",
+        "--model", model,
+        "--effort", effort,
+        "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+        prompt_text,
+    ]
+
+
+def build_env(account_id: int, tool: str) -> dict:
+    env = os.environ.copy()
+    if tool == "codex":
+        env["CODEX_HOME"] = str(accounts.account_dir(account_id, "codex"))
+    else:
+        env["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(account_id, "claude"))
+    return env
+
+
+def run_log_dir(project_dir: Path, tool: str) -> Path:
+    return project_dir / (".codex-runs" if tool == "codex" else ".claude-runs")
+
+
+def stop_process(proc: subprocess.Popen, grace_sec: float = 5) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=grace_sec)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def run_step(
+    account_id: int,
+    tool: str,
+    project_dir: Path,
+    prompt_text: str,
+    model: str,
+    effort: str,
+    *,
+    out=None,
+) -> StepOutcome:
+    out = out if out is not None else sys.stdout
+    log_dir = run_log_dir(project_dir, tool)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"step-{datetime.now():%Y%m%d-%H%M%S}-user{account_id}"
+    log_path = log_dir / f"{stem}.log"
+    raw_path = log_dir / f"{stem}.raw.jsonl"
+    reader = CodexEventReader() if tool == "codex" else ClaudeEventReader()
+    text_parts: list[str] = []
+
+    with open(raw_path, "w", encoding="utf-8") as raw_file, open(log_path, "w", encoding="utf-8") as log_file:
+        proc = subprocess.Popen(
+            build_command(tool, project_dir, prompt_text, model, effort),
+            cwd=project_dir,
+            env=build_env(account_id, tool),
+            # codex는 stdin이 열려 있으면 추가 입력을 기다린다.
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            for line in proc.stdout:
+                raw_file.write(line)
+                text = reader.feed(line)
+                if text:
+                    text_parts.append(text)
+                    log_file.write(text)
+                    log_file.flush()
+                    out.write(text)
+                    out.flush()
+            exit_code = proc.wait()
+        except BaseException:
+            stop_process(proc)
+            raise
+
+    out.write("\n")
+    out.flush()
+    return StepOutcome(
+        step_status=find_step_status("".join(text_parts)),
+        limit_hit=reader.limit_hit,
+        limit_reset_at=reader.limit_reset_at,
+        account_error=reader.account_error,
+        exit_code=exit_code,
+        log_path=log_path,
+    )
