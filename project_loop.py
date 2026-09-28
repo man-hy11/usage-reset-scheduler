@@ -132,3 +132,130 @@ def write_lock_info(fd: int, info: str) -> None:
 
 def release_project_lock(fd: int) -> None:
     os.close(fd)
+
+
+CONTINUE_MESSAGES = {
+    "COMPLETE": "현재 Step 완료. 같은 계정으로 다음 실행을 이어갑니다.",
+    "FAILURE_ANALYSIS": "실패가 기록되었습니다. 다음 실행에서 실패 원인을 분석합니다.",
+    "FAILURE_IMPROVEMENT": "실패 분석이 완료되었습니다. 다음 실행에서 개선 계획을 실행합니다.",
+}
+
+
+def _pick_next(loop_accounts: list[LoopAccount], now: int) -> LoopAccount | None:
+    ready = [account for account in loop_accounts if account.available_at <= now]
+    if not ready:
+        return None
+    return min(ready, key=lambda account: (account.available_at, account.account_id))
+
+
+def _set_exhausted(account: LoopAccount, available_at: int, reason: str, print_fn) -> None:
+    account.status = "exhausted"
+    account.available_at = available_at
+    account.reason = reason
+    account.runs = 0
+    print_fn(f"user{account.account_id} [{account.tool}] {reason} → {_fmt(available_at)} 재투입")
+
+
+def _limit_available_at(outcome: StepOutcome, account: LoopAccount, fetch_usage_fn, now: int, interval_min: int, print_fn) -> tuple[int, str]:
+    if outcome.limit_reset_at is not None and outcome.limit_reset_at > now:
+        return outcome.limit_reset_at + RESET_GRACE_SEC, "한도 초과"
+    status = _safe_usage(fetch_usage_fn, account, print_fn)
+    block = usage_block(status, now, interval_min) if status is not None else None
+    if block is not None:
+        return block
+    return now + interval_min * 60, "한도 초과(리셋 시각 미확인)"
+
+
+def run_project_loop(
+    loop_accounts: list[LoopAccount],
+    *,
+    run_step_fn,
+    fetch_usage_fn,
+    check_plan_fn,
+    sleep_fn,
+    now_fn,
+    interval_min: int,
+    print_fn=print,
+) -> int:
+    current: LoopAccount | None = None
+    unknown_fail_streak = 0
+
+    while True:
+        now = now_fn()
+        if current is None or current.available_at > now:
+            current = _pick_next(loop_accounts, now)
+            if current is None:
+                soonest = min(loop_accounts, key=lambda account: (account.available_at, account.account_id))
+                print_fn(f"[{_fmt(now)}] 사용 가능한 계정 없음 → user{soonest.account_id} 재개 {_fmt(soonest.available_at)}까지 대기")
+                sleep_fn(soonest.available_at - now)
+                continue
+
+        if current.status == "account_error":
+            if check_plan_fn(current.account_id, current.tool) is None:
+                current.available_at = now_fn() + ACCOUNT_RECHECK_SEC
+                print_fn(f"user{current.account_id} 계정 오류 지속 → {_fmt(current.available_at)} 재확인")
+                current = None
+                continue
+            print_fn(f"user{current.account_id} 계정 확인 완료 → 다시 사용합니다.")
+
+        # 큐에서는 사용 가능해 보여도 그 사이 직접 사용해 한도가 찼을 수 있다.
+        status = _safe_usage(fetch_usage_fn, current, print_fn)
+        block = usage_block(status, now_fn(), interval_min) if status is not None else None
+        if block is not None:
+            _set_exhausted(current, *block, print_fn)
+            current = None
+            continue
+
+        current.status = "ready"
+        current.reason = None
+        current.runs += 1
+        print_fn(format_status(loop_accounts, current, now_fn()))
+        outcome = run_step_fn(current)
+        now = now_fn()
+
+        if outcome.step_status in CONTINUE_STATUSES:
+            unknown_fail_streak = 0
+            print_fn(CONTINUE_MESSAGES[outcome.step_status])
+            continue
+
+        if outcome.step_status == "INCOMPLETE":
+            print_fn(
+                "현재 Step이 미완료 또는 차단되었습니다(STEP_STATUS: INCOMPLETE). "
+                "계정을 바꿔도 해결되지 않으므로 중단합니다.\n"
+                f"로그: {outcome.log_path}"
+            )
+            return 1
+
+        if outcome.limit_hit:
+            unknown_fail_streak = 0
+            available_at, reason = _limit_available_at(outcome, current, fetch_usage_fn, now, interval_min, print_fn)
+            _set_exhausted(current, available_at, reason, print_fn)
+            current = None
+            continue
+
+        if outcome.account_error is not None:
+            current.status = "account_error"
+            current.reason = outcome.account_error
+            current.available_at = now + ACCOUNT_RECHECK_SEC
+            current.runs = 0
+            print_fn(f"user{current.account_id} 계정 오류({outcome.account_error}) → {_fmt(current.available_at)} 재확인")
+            current = None
+            continue
+
+        # STEP_STATUS도 신호도 없음: 사용률이 거의 다 찼으면 신호를 놓친 한도 초과로 본다.
+        status = _safe_usage(fetch_usage_fn, current, print_fn)
+        block = usage_block(status, now, interval_min, min_percent=AMBIGUOUS_LIMIT_PERCENT) if status is not None else None
+        if block is not None:
+            unknown_fail_streak = 0
+            _set_exhausted(current, *block, print_fn)
+            current = None
+            continue
+
+        unknown_fail_streak += 1
+        print_fn(
+            f"완료 상태 문자열도 한도 신호도 찾지 못했습니다 "
+            f"({unknown_fail_streak}/{UNKNOWN_FAIL_LIMIT}, 종료 코드 {outcome.exit_code}). 로그: {outcome.log_path}"
+        )
+        if unknown_fail_streak >= UNKNOWN_FAIL_LIMIT:
+            print_fn("알 수 없는 실패가 연속되어 안전하게 중단합니다.")
+            return 1
